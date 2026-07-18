@@ -1,0 +1,35 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <thread>
+
+bool installSignalHandlers();
+
+class TcpServer {
+public:
+    explicit TcpServer(std::uint16_t port);
+    ~TcpServer();
+
+    TcpServer(const TcpServer&) = delete;
+    TcpServer& operator=(const TcpServer&) = delete;
+
+    bool start();
+    void run();
+
+private:
+    void handleClient(int client_fd);
+
+    bool createSocket();
+    bool bindPort() const;
+    bool listenConnections() const;
+    int acceptClient() const;
+
+    static void closeSocket(int& fd);
+    static bool sendAll(int client_fd, const char* data, std::size_t size);
+    static void echoClient(int client_fd);
+    static void printError(const char* operation);
+
+    std::uint16_t port_;
+    int server_fd_ = -1;
+};
