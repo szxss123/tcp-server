@@ -120,7 +120,9 @@ void TcpServer::run() {
             continue;
         }
 
-        std::thread(&TcpServer::handleClient, this, client_fd).detach();
+        thread_pool_.submit([this, client_fd] {
+            handleClient(client_fd);
+        });
     }
 }
 

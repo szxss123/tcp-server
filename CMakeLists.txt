@@ -9,6 +9,7 @@ find_package(Threads REQUIRED)
 add_executable(tcp_server
     src/main.cpp
     src/TcpServer.cpp
+    src/ThreadPool.cpp
 )
 
 target_include_directories(tcp_server PRIVATE include)

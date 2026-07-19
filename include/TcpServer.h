@@ -1,8 +1,9 @@
 #pragma once
 
+#include "ThreadPool.h"
+
 #include <cstddef>
 #include <cstdint>
-#include <thread>
 
 bool installSignalHandlers();
 
@@ -32,4 +33,5 @@ private:
 
     std::uint16_t port_;
     int server_fd_ = -1;
+    ThreadPool thread_pool_{4};
 };
