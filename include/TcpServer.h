@@ -27,8 +27,6 @@ private:
     int acceptClient() const;
 
     static void closeSocket(int& fd);
-    static bool sendAll(int client_fd, const char* data, std::size_t size);
-    static void echoClient(int client_fd);
     static void printError(const char* operation);
 
     std::uint16_t port_;

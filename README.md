@@ -1,95 +1,56 @@
-# Minimal C++ TCP Server
+# C++ HTTP Server
 
-一个面向 WSL2/Linux 的最小 C++17 TCP 回显服务器。它接受客户端连接，循环读取并原样回传数据；客户端断开后，服务端关闭连接并继续等待下一个客户端。
+基于 C++17、Linux Socket、CMake 和线程池实现的简易 HTTP Server。
 
-## 1. 配置 WSL2（Windows PowerShell，管理员）
+## 当前功能
 
-```powershell
-wsl --install -d Ubuntu
-```
+- TCP 端口监听
+- 多客户端并发连接
+- 固定大小线程池
+- HTTP GET 请求处理
+- 200 和 405 响应
+- RAII 资源管理
 
-安装后重启 Windows，打开 Ubuntu，并在项目根目录执行：
-
-```bash
-chmod +x scripts/setup_wsl.sh
-./scripts/setup_wsl.sh
-```
-
-如果项目位于 Windows 的 `C:` 盘，可从 WSL2 通过 `/mnt/c/...` 访问。开发时建议把仓库放在 WSL 的 Linux 文件系统（如 `~/projects`），编译和文件访问通常更快。
-
-## 2. 编译
+## 编译运行
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build -j
+cmake -S . -B build
+cmake --build build
+./build/tcp_server
 ```
 
-## 3. 运行和测试
-
-终端 1：
+服务器默认监听 `0.0.0.0:8080`。也可以通过命令行参数指定端口：
 
 ```bash
-./build/tcp_server 8080
+./build/tcp_server 9000
 ```
 
-终端 2：
+## HTTP 测试
+
+发送 GET 请求：
 
 ```bash
-nc 127.0.0.1 8080
+curl -v http://127.0.0.1:8080/
 ```
 
-输入任意内容，例如：
+浏览器访问：
 
 ```text
-hello
+http://127.0.0.1:8080/
 ```
 
-客户端会原样收到 `hello`。可以在同一连接中连续输入多条消息；退出 `nc` 后再次连接，服务端仍会继续接受并回显消息。
-
-端口参数可省略，默认监听 `8080`。服务端监听 `0.0.0.0`，因此 Windows 通常也可通过 `localhost:8080` 访问。
-
-## 4. 使用 GDB
+发送非 GET 请求：
 
 ```bash
-gdb --args ./build/tcp_server 8080
+curl -v -X POST http://127.0.0.1:8080/
 ```
 
-进入 GDB 后：
+非 GET 请求将返回：
 
-```gdb
-break main
-run
+```http
+HTTP/1.1 405 Method Not Allowed
 ```
 
-如果使用 VS Code，请在 WSL2 中安装 `code`，安装 **WSL** 与 **C/C++** 扩展，然后选择 `Debug TCP Server`。项目已包含构建任务和 GDB 启动配置。
+## 简历素材
 
-## 5. 创建 GitHub 仓库
-
-先在 GitHub 创建一个空仓库（不要勾选 README），然后执行：
-
-```bash
-git init
-git add .
-git commit -m "feat: add minimal TCP server"
-git branch -M main
-git remote add origin https://github.com/YOUR_NAME/tcp-server.git
-git push -u origin main
-```
-
-也可以安装并登录 GitHub CLI 后一条命令创建：
-
-```bash
-gh auth login
-gh repo create tcp-server --public --source=. --remote=origin --push
-```
-
-## 目录结构
-
-```text
-.
-├── .vscode/           # VS Code 构建与 GDB 调试配置
-├── scripts/           # WSL2 工具链安装脚本
-├── src/main.cpp       # TCP Server
-├── CMakeLists.txt     # CMake 构建配置
-└── README.md
-```
+基于 C++17 与 Linux Socket 实现多线程 HTTP 服务器，使用固定大小线程池管理并发连接，支持基础 HTTP 请求解析与响应，并通过 RAII 管理网络资源。

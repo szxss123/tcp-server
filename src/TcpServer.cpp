@@ -3,8 +3,10 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <string>
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -127,57 +129,72 @@ void TcpServer::run() {
 }
 
 void TcpServer::handleClient(int client_fd) {
-    echoClient(client_fd);
-    closeSocket(client_fd);
-}
-
-bool TcpServer::sendAll(int client_fd, const char* data, std::size_t size) {
-    std::size_t sent = 0;
-    while (sent < size) {
-        const ssize_t result = ::send(client_fd, data + sent,
-                                      size - sent, MSG_NOSIGNAL);
-        if (result > 0) {
-            sent += static_cast<std::size_t>(result);
-            continue;
-        }
-        if (result < 0 && errno == EINTR) {
-            continue;
-        }
-
-        if (result < 0) {
-            printError("send");
-        }
-        return false;
-    }
-    return true;
-}
-
-void TcpServer::echoClient(int client_fd) {
     char buffer[4096];
 
-    while (g_running) {
-        const ssize_t bytes_read = ::recv(client_fd, buffer,
-                                          sizeof(buffer), 0);
-        if (bytes_read > 0) {
-            if (!sendAll(client_fd, buffer,
-                         static_cast<std::size_t>(bytes_read))) {
-                break;
-            }
-            continue;
-        }
-        if (bytes_read == 0) {
-            std::cout << "Client closed the connection." << std::endl;
+    const ssize_t n = ::recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    if (n <= 0) {
+        ::close(client_fd);
+        return;
+    }
+
+    buffer[n] = '\0';
+    const std::string request(buffer, static_cast<std::size_t>(n));
+
+    std::cout << "Request:\n" << request << '\n';
+
+    const bool is_get = request.rfind("GET ", 0) == 0;
+
+    std::string body;
+    std::string response;
+
+    if (is_get) {
+        body =
+            "<!DOCTYPE html>"
+            "<html>"
+            "<head><meta charset=\"UTF-8\"><title>C++ Server</title></head>"
+            "<body>"
+            "<h1>Hello from C++ HTTP Server</h1>"
+            "<p>The server is running successfully.</p>"
+            "</body>"
+            "</html>";
+
+        response =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=UTF-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n" +
+            body;
+    } else {
+        body = "Method Not Allowed";
+
+        response =
+            "HTTP/1.1 405 Method Not Allowed\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n" +
+            body;
+    }
+
+    std::size_t total_sent = 0;
+    while (total_sent < response.size()) {
+        const ssize_t sent = ::send(
+            client_fd,
+            response.data() + total_sent,
+            response.size() - total_sent,
+            0);
+
+        if (sent <= 0) {
+            ::perror("send");
             break;
         }
-        if (errno == EINTR) {
-            continue;
-        }
 
-        printError("recv");
-        break;
+        total_sent += static_cast<std::size_t>(sent);
     }
-}
 
+    ::close(client_fd);
+}
 void TcpServer::printError(const char* operation) {
     std::cerr << operation << " failed: " << std::strerror(errno) << '\n';
 }
