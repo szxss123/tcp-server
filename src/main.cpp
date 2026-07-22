@@ -8,12 +8,15 @@
 
 namespace {
 
+constexpr std::uint16_t kDefaultPort = 8080;
+constexpr unsigned long kMaxPort = 65535;
+
 bool parsePort(const char* text, std::uint16_t& port) {
     try {
         const std::string value(text);
         std::size_t parsed = 0;
         const unsigned long number = std::stoul(value, &parsed);
-        if (parsed != value.size() || number == 0 || number > 65535) {
+        if (parsed != value.size() || number == 0 || number > kMaxPort) {
             return false;
         }
         port = static_cast<std::uint16_t>(number);
@@ -26,7 +29,7 @@ bool parsePort(const char* text, std::uint16_t& port) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    std::uint16_t port = 8080;
+    std::uint16_t port = kDefaultPort;
     if (argc > 2 || (argc == 2 && !parsePort(argv[1], port))) {
         std::cerr << "Usage: " << argv[0] << " [port]\n";
         return 1;

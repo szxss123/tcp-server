@@ -26,6 +26,7 @@ ThreadPool::ThreadPool(std::size_t thread_count) {
         });
     }
 }
+
 void ThreadPool::submit(std::function<void()> task) {
     {
         std::lock_guard<std::mutex> lock(mutex_);

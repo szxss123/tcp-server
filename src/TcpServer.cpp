@@ -3,7 +3,6 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
-#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -12,6 +11,29 @@
 #include <unistd.h>
 
 namespace {
+
+constexpr std::size_t kRequestBufferSize = 4096;
+
+class SocketHandle {
+public:
+    explicit SocketHandle(int fd) : fd_(fd) {}
+
+    ~SocketHandle() {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+
+    SocketHandle(const SocketHandle&) = delete;
+    SocketHandle& operator=(const SocketHandle&) = delete;
+
+    int get() const {
+        return fd_;
+    }
+
+private:
+    int fd_;
+};
 
 volatile std::sig_atomic_t g_running = 1;
 
@@ -97,9 +119,13 @@ int TcpServer::acceptClient() const {
     }
 
     char client_ip[INET_ADDRSTRLEN]{};
-    ::inet_ntop(AF_INET, &client_address.sin_addr,
-                client_ip, sizeof(client_ip));
-    std::cout << "Accepted connection from " << client_ip << ':'
+    const char* converted_ip = ::inet_ntop(
+        AF_INET, &client_address.sin_addr, client_ip, sizeof(client_ip));
+    if (converted_ip == nullptr) {
+        printError("inet_ntop");
+        converted_ip = "<unknown>";
+    }
+    std::cout << "Accepted connection from " << converted_ip << ':'
               << ntohs(client_address.sin_port) << std::endl;
     return client_fd;
 }
@@ -129,11 +155,19 @@ void TcpServer::run() {
 }
 
 void TcpServer::handleClient(int client_fd) {
-    char buffer[4096];
+    const SocketHandle client_socket(client_fd);
+    char buffer[kRequestBufferSize];
 
-    const ssize_t n = ::recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-    if (n <= 0) {
-        ::close(client_fd);
+    ssize_t n;
+    do {
+        n = ::recv(client_socket.get(), buffer, sizeof(buffer) - 1, 0);
+    } while (n < 0 && errno == EINTR);
+
+    if (n < 0) {
+        printError("recv");
+        return;
+    }
+    if (n == 0) {
         return;
     }
 
@@ -180,21 +214,27 @@ void TcpServer::handleClient(int client_fd) {
     std::size_t total_sent = 0;
     while (total_sent < response.size()) {
         const ssize_t sent = ::send(
-            client_fd,
+            client_socket.get(),
             response.data() + total_sent,
             response.size() - total_sent,
-            0);
+            MSG_NOSIGNAL);
 
-        if (sent <= 0) {
-            ::perror("send");
-            break;
+        if (sent > 0) {
+            total_sent += static_cast<std::size_t>(sent);
+            continue;
         }
-
-        total_sent += static_cast<std::size_t>(sent);
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent < 0) {
+            printError("send");
+        } else {
+            std::cerr << "send returned zero bytes\n";
+        }
+        break;
     }
-
-    ::close(client_fd);
 }
+
 void TcpServer::printError(const char* operation) {
     std::cerr << operation << " failed: " << std::strerror(errno) << '\n';
 }

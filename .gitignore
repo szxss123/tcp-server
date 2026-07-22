@@ -1,6 +1,5 @@
-/build/
-/.cache/
-/.vscode/*.log
+build/
+.cache/
+.vscode/
 *.o
 *.out
-

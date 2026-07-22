@@ -19,6 +19,8 @@ public:
     void run();
 
 private:
+    static constexpr std::size_t kThreadCount = 4;
+
     void handleClient(int client_fd);
 
     bool createSocket();
@@ -30,6 +32,6 @@ private:
     static void printError(const char* operation);
 
     std::uint16_t port_;
-    int server_fd_ = -1;
-    ThreadPool thread_pool_{4};
+    int server_fd_{-1};
+    ThreadPool thread_pool_{kThreadCount};
 };
