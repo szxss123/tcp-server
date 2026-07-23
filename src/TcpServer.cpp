@@ -8,32 +8,10 @@
 #include <string>
 
 #include <sys/socket.h>
-#include <unistd.h>
 
 namespace {
 
 constexpr std::size_t kRequestBufferSize = 4096;
-
-class SocketHandle {
-public:
-    explicit SocketHandle(int fd) : fd_(fd) {}
-
-    ~SocketHandle() {
-        if (fd_ >= 0) {
-            ::close(fd_);
-        }
-    }
-
-    SocketHandle(const SocketHandle&) = delete;
-    SocketHandle& operator=(const SocketHandle&) = delete;
-
-    int get() const {
-        return fd_;
-    }
-
-private:
-    int fd_;
-};
 
 volatile std::sig_atomic_t g_running = 1;
 
@@ -57,34 +35,31 @@ bool installSignalHandlers() {
 
 TcpServer::TcpServer(std::uint16_t port) : port_(port) {}
 
-TcpServer::~TcpServer() {
-    closeSocket(server_fd_);
-}
-
 bool TcpServer::createSocket() {
-    server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd_ < 0) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
         printError("socket");
         return false;
     }
+    listen_socket_.reset(fd);
 
     int reuse_address = 1;
-    if (::setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR,
+    if (::setsockopt(listen_socket_.get(), SOL_SOCKET, SO_REUSEADDR,
                      &reuse_address, sizeof(reuse_address)) < 0) {
         printError("setsockopt");
-        closeSocket(server_fd_);
+        listen_socket_.reset();
         return false;
     }
     return true;
 }
-
 bool TcpServer::bindPort() const {
     sockaddr_in server_address{};
     server_address.sin_family = AF_INET;
     server_address.sin_addr.s_addr = htonl(INADDR_ANY);
     server_address.sin_port = htons(port_);
 
-    if (::bind(server_fd_, reinterpret_cast<sockaddr*>(&server_address),
+    if (::bind(listen_socket_.get(),
+               reinterpret_cast<sockaddr*>(&server_address),
                sizeof(server_address)) < 0) {
         printError("bind");
         return false;
@@ -93,7 +68,7 @@ bool TcpServer::bindPort() const {
 }
 
 bool TcpServer::listenConnections() const {
-    if (::listen(server_fd_, SOMAXCONN) < 0) {
+    if (::listen(listen_socket_.get(), SOMAXCONN) < 0) {
         printError("listen");
         return false;
     }
@@ -108,7 +83,7 @@ int TcpServer::acceptClient() const {
     socklen_t address_length = sizeof(client_address);
 
     const int client_fd = ::accept(
-        server_fd_, reinterpret_cast<sockaddr*>(&client_address),
+        listen_socket_.get(), reinterpret_cast<sockaddr*>(&client_address),
         &address_length);
 
     if (client_fd < 0) {
@@ -130,13 +105,6 @@ int TcpServer::acceptClient() const {
     return client_fd;
 }
 
-void TcpServer::closeSocket(int& fd) {
-    if (fd >= 0) {
-        ::close(fd);
-        fd = -1;
-    }
-}
-
 bool TcpServer::start() {
     return createSocket() && bindPort() && listenConnections();
 }
@@ -155,7 +123,7 @@ void TcpServer::run() {
 }
 
 void TcpServer::handleClient(int client_fd) {
-    const SocketHandle client_socket(client_fd);
+    SocketFd client_socket(client_fd);
     char buffer[kRequestBufferSize];
 
     ssize_t n;

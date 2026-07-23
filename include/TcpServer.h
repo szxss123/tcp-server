@@ -1,5 +1,6 @@
 #pragma once
 
+#include "SocketFd.h"
 #include "ThreadPool.h"
 
 #include <cstddef>
@@ -10,7 +11,7 @@ bool installSignalHandlers();
 class TcpServer {
 public:
     explicit TcpServer(std::uint16_t port);
-    ~TcpServer();
+    ~TcpServer() = default;
 
     TcpServer(const TcpServer&) = delete;
     TcpServer& operator=(const TcpServer&) = delete;
@@ -28,10 +29,9 @@ private:
     bool listenConnections() const;
     int acceptClient() const;
 
-    static void closeSocket(int& fd);
     static void printError(const char* operation);
 
     std::uint16_t port_;
-    int server_fd_{-1};
+    SocketFd listen_socket_;
     ThreadPool thread_pool_{kThreadCount};
 };
