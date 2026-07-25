@@ -1,12 +1,17 @@
 #include "TcpServer.h"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <string>
+#include <unordered_map>
+#include <utility>
 
+#include <sys/select.h>
 #include <sys/socket.h>
 
 namespace {
@@ -78,50 +83,91 @@ bool TcpServer::listenConnections() const {
     return true;
 }
 
-int TcpServer::acceptClient() const {
-    sockaddr_in client_address{};
-    socklen_t address_length = sizeof(client_address);
-
-    const int client_fd = ::accept(
-        listen_socket_.get(), reinterpret_cast<sockaddr*>(&client_address),
-        &address_length);
-
-    if (client_fd < 0) {
-        if (errno != EINTR) {
-            printError("accept");
-        }
-        return -1;
-    }
-
-    char client_ip[INET_ADDRSTRLEN]{};
-    const char* converted_ip = ::inet_ntop(
-        AF_INET, &client_address.sin_addr, client_ip, sizeof(client_ip));
-    if (converted_ip == nullptr) {
-        printError("inet_ntop");
-        converted_ip = "<unknown>";
-    }
-    std::cout << "Accepted connection from " << converted_ip << ':'
-              << ntohs(client_address.sin_port) << std::endl;
-    return client_fd;
-}
-
 bool TcpServer::start() {
     return createSocket() && bindPort() && listenConnections();
 }
 
 void TcpServer::run() {
+    fd_set master_set;
+    FD_ZERO(&master_set);
+
+    const int listen_fd = listen_socket_.get();
+    if (listen_fd < 0 || listen_fd >= FD_SETSIZE) {
+        std::cerr << "listen socket is outside select() range\n";
+        return;
+    }
+
+    FD_SET(listen_fd, &master_set);
+    int max_fd = listen_fd;
+    std::unordered_map<int, SocketFd> waiting_clients;
+
     while (g_running) {
-        int client_fd = acceptClient();
-        if (client_fd < 0) {
-            continue;
+        fd_set ready_set = master_set;
+
+        const int ready_count = ::select(
+            max_fd + 1, &ready_set, nullptr, nullptr, nullptr);
+
+        if (ready_count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            printError("select");
+            break;
         }
 
-        thread_pool_.submit([this, client_fd] {
-            handleClient(client_fd);
-        });
+        for (int fd = 0; fd <= max_fd; ++fd) {
+            if (!FD_ISSET(fd, &ready_set)) {
+                continue;
+            }
+
+            if (fd == listen_fd) {
+                SocketFd client_socket(::accept(listen_fd, nullptr, nullptr));
+                if (!client_socket.valid()) {
+                    printError("accept");
+                    continue;
+                }
+
+                const int client_fd = client_socket.get();
+                if (client_fd >= FD_SETSIZE) {
+                    std::cerr << "client fd exceeds FD_SETSIZE: "
+                              << client_fd << '\n';
+                    continue;
+                }
+
+                const auto [position, inserted] = waiting_clients.try_emplace(
+                    client_fd, std::move(client_socket));
+                if (!inserted) {
+                    std::cerr << "client fd is already registered: "
+                              << client_fd << '\n';
+                    continue;
+                }
+
+                FD_SET(position->first, &master_set);
+                max_fd = std::max(max_fd, position->first);
+                std::cout << "client connected, fd="
+                          << position->first << '\n';
+                continue;
+            }
+
+            FD_CLR(fd, &master_set);
+
+            auto client = waiting_clients.find(fd);
+            if (client == waiting_clients.end()) {
+                std::cerr << "ready client fd is not registered: "
+                          << fd << '\n';
+                continue;
+            }
+
+            const auto client_socket = std::make_shared<SocketFd>(
+                std::move(client->second));
+            waiting_clients.erase(client);
+
+            thread_pool_.submit([this, client_socket] {
+                handleClient(client_socket->release());
+            });
+        }
     }
 }
-
 void TcpServer::handleClient(int client_fd) {
     SocketFd client_socket(client_fd);
     char buffer[kRequestBufferSize];

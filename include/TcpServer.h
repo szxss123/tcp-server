@@ -27,7 +27,6 @@ private:
     bool createSocket();
     bool bindPort() const;
     bool listenConnections() const;
-    int acceptClient() const;
 
     static void printError(const char* operation);
 
