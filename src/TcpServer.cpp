@@ -1,18 +1,19 @@
 #include "TcpServer.h"
 
-#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <poll.h>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
-#include <sys/select.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 namespace {
 
@@ -88,83 +89,81 @@ bool TcpServer::start() {
 }
 
 void TcpServer::run() {
-    fd_set master_set;
-    FD_ZERO(&master_set);
-
-    const int listen_fd = listen_socket_.get();
-    if (listen_fd < 0 || listen_fd >= FD_SETSIZE) {
-        std::cerr << "listen socket is outside select() range\n";
-        return;
-    }
-
-    FD_SET(listen_fd, &master_set);
-    int max_fd = listen_fd;
+    std::vector<pollfd> fds{
+        {listen_socket_.get(), POLLIN, 0},
+    };
     std::unordered_map<int, SocketFd> waiting_clients;
 
     while (g_running) {
-        fd_set ready_set = master_set;
-
-        const int ready_count = ::select(
-            max_fd + 1, &ready_set, nullptr, nullptr, nullptr);
+        const int ready_count = ::poll(
+            fds.data(), static_cast<nfds_t>(fds.size()), -1);
 
         if (ready_count < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            printError("select");
+            printError("poll");
             break;
         }
 
-        for (int fd = 0; fd <= max_fd; ++fd) {
-            if (!FD_ISSET(fd, &ready_set)) {
-                continue;
-            }
-
-            if (fd == listen_fd) {
-                SocketFd client_socket(::accept(listen_fd, nullptr, nullptr));
-                if (!client_socket.valid()) {
+        if ((fds.front().revents & POLLIN) != 0) {
+            SocketFd client_socket(
+                ::accept(listen_socket_.get(), nullptr, nullptr));
+            if (!client_socket.valid()) {
+                if (errno != EINTR) {
                     printError("accept");
-                    continue;
                 }
-
+            } else {
                 const int client_fd = client_socket.get();
-                if (client_fd >= FD_SETSIZE) {
-                    std::cerr << "client fd exceeds FD_SETSIZE: "
-                              << client_fd << '\n';
-                    continue;
-                }
-
                 const auto [position, inserted] = waiting_clients.try_emplace(
                     client_fd, std::move(client_socket));
-                if (!inserted) {
+                if (inserted) {
+                    fds.push_back({position->first, POLLIN, 0});
+                    std::cout << "client connected, fd="
+                              << position->first << '\n';
+                } else {
                     std::cerr << "client fd is already registered: "
+                              << client_fd << '\n';
+                }
+            }
+        }
+
+        if ((fds.front().revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            std::cerr << "listening socket reported a poll error\n";
+            break;
+        }
+
+        for (std::size_t i = 1; i < fds.size();) {
+            const short events = fds[i].revents;
+            const int client_fd = fds[i].fd;
+
+            if ((events & POLLIN) != 0) {
+                fds.erase(fds.begin() + i);
+
+                auto client = waiting_clients.find(client_fd);
+                if (client == waiting_clients.end()) {
+                    std::cerr << "ready client fd is not registered: "
                               << client_fd << '\n';
                     continue;
                 }
 
-                FD_SET(position->first, &master_set);
-                max_fd = std::max(max_fd, position->first);
-                std::cout << "client connected, fd="
-                          << position->first << '\n';
+                const auto client_socket = std::make_shared<SocketFd>(
+                    std::move(client->second));
+                waiting_clients.erase(client);
+
+                thread_pool_.submit([this, client_socket] {
+                    handleClient(client_socket->release());
+                });
                 continue;
             }
 
-            FD_CLR(fd, &master_set);
-
-            auto client = waiting_clients.find(fd);
-            if (client == waiting_clients.end()) {
-                std::cerr << "ready client fd is not registered: "
-                          << fd << '\n';
+            if ((events & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                waiting_clients.erase(client_fd);
+                fds.erase(fds.begin() + i);
                 continue;
             }
 
-            const auto client_socket = std::make_shared<SocketFd>(
-                std::move(client->second));
-            waiting_clients.erase(client);
-
-            thread_pool_.submit([this, client_socket] {
-                handleClient(client_socket->release());
-            });
+            ++i;
         }
     }
 }
