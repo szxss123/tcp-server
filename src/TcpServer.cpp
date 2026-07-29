@@ -6,12 +6,12 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
-#include <poll.h>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -89,61 +89,97 @@ bool TcpServer::start() {
 }
 
 void TcpServer::run() {
-    std::vector<pollfd> fds{
-        {listen_socket_.get(), POLLIN, 0},
-    };
+    SocketFd epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
+    if (!epoll_fd.valid()) {
+        printError("epoll_create1");
+        return;
+    }
+
+    epoll_event listen_event{};
+    listen_event.events = EPOLLIN;
+    listen_event.data.fd = listen_socket_.get();
+
+    if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, listen_socket_.get(),
+                    &listen_event) < 0) {
+        printError("epoll_ctl ADD listen");
+        return;
+    }
+
+    constexpr int kMaxEvents = 64;
+    std::vector<epoll_event> events(kMaxEvents);
     std::unordered_map<int, SocketFd> waiting_clients;
 
     while (g_running) {
-        const int ready_count = ::poll(
-            fds.data(), static_cast<nfds_t>(fds.size()), -1);
+        const int ready_count = ::epoll_wait(
+            epoll_fd.get(), events.data(), kMaxEvents, -1);
 
         if (ready_count < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            printError("poll");
+            printError("epoll_wait");
             break;
         }
 
-        if ((fds.front().revents & POLLIN) != 0) {
-            SocketFd client_socket(
-                ::accept(listen_socket_.get(), nullptr, nullptr));
-            if (!client_socket.valid()) {
-                if (errno != EINTR) {
-                    printError("accept");
-                }
-            } else {
-                const int client_fd = client_socket.get();
-                const auto [position, inserted] = waiting_clients.try_emplace(
-                    client_fd, std::move(client_socket));
-                if (inserted) {
-                    fds.push_back({position->first, POLLIN, 0});
+        for (int i = 0; i < ready_count; ++i) {
+            const int fd = events[i].data.fd;
+            const std::uint32_t active_events = events[i].events;
+
+            if (fd == listen_socket_.get()) {
+                if ((active_events & EPOLLIN) != 0) {
+                    SocketFd client_socket(
+                        ::accept(listen_socket_.get(), nullptr, nullptr));
+                    if (!client_socket.valid()) {
+                        if (errno != EINTR) {
+                            printError("accept");
+                        }
+                        continue;
+                    }
+
+                    const int client_fd = client_socket.get();
+                    epoll_event client_event{};
+                    client_event.events = EPOLLIN | EPOLLRDHUP;
+                    client_event.data.fd = client_fd;
+
+                    if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, client_fd,
+                                    &client_event) < 0) {
+                        printError("epoll_ctl ADD client");
+                        continue;
+                    }
+
+                    const auto [position, inserted] =
+                        waiting_clients.try_emplace(
+                            client_fd, std::move(client_socket));
+                    if (!inserted) {
+                        std::cerr << "client fd is already registered: "
+                                  << client_fd << '\n';
+                        ::epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL, client_fd,
+                                    nullptr);
+                        continue;
+                    }
+
                     std::cout << "client connected, fd="
                               << position->first << '\n';
-                } else {
-                    std::cerr << "client fd is already registered: "
-                              << client_fd << '\n';
                 }
+
+                if ((active_events & (EPOLLERR | EPOLLHUP)) != 0) {
+                    std::cerr
+                        << "listening socket reported an epoll error\n";
+                    return;
+                }
+                continue;
             }
-        }
 
-        if ((fds.front().revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-            std::cerr << "listening socket reported a poll error\n";
-            break;
-        }
+            if ((active_events & EPOLLIN) != 0) {
+                if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL, fd, nullptr) <
+                    0) {
+                    printError("epoll_ctl DEL client");
+                }
 
-        for (std::size_t i = 1; i < fds.size();) {
-            const short events = fds[i].revents;
-            const int client_fd = fds[i].fd;
-
-            if ((events & POLLIN) != 0) {
-                fds.erase(fds.begin() + i);
-
-                auto client = waiting_clients.find(client_fd);
+                auto client = waiting_clients.find(fd);
                 if (client == waiting_clients.end()) {
                     std::cerr << "ready client fd is not registered: "
-                              << client_fd << '\n';
+                              << fd << '\n';
                     continue;
                 }
 
@@ -157,13 +193,14 @@ void TcpServer::run() {
                 continue;
             }
 
-            if ((events & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-                waiting_clients.erase(client_fd);
-                fds.erase(fds.begin() + i);
-                continue;
+            if ((active_events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0) {
+                if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL, fd, nullptr) <
+                        0 &&
+                    errno != ENOENT) {
+                    printError("epoll_ctl DEL client");
+                }
+                waiting_clients.erase(fd);
             }
-
-            ++i;
         }
     }
 }
