@@ -1,5 +1,7 @@
 #include "TcpServer.h"
 
+#include "HttpRequest.h"
+
 #include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
@@ -18,7 +20,8 @@
 
 namespace {
 
-constexpr std::size_t kRequestBufferSize = 4096;
+constexpr std::size_t kMaxHeaderSize = 8192;
+constexpr std::size_t kReadBufferSize = 2048;
 
 volatile std::sig_atomic_t g_running = 1;
 
@@ -43,6 +46,39 @@ bool installSignalHandler(int signal_number) {
     return ::sigaction(signal_number, &action, nullptr) == 0;
 }
 
+void sendResponse(int fd,
+                  int status_code,
+                  const std::string& reason,
+                  const std::string& body) {
+    const std::string response =
+        "HTTP/1.1 " + std::to_string(status_code) + " " + reason + "\r\n"
+        "Content-Type: text/html; charset=UTF-8\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "Connection: close\r\n"
+        "\r\n" +
+        body;
+
+    std::size_t total_sent = 0;
+    while (total_sent < response.size()) {
+        const ssize_t sent =
+            ::send(fd, response.data() + total_sent,
+                   response.size() - total_sent, MSG_NOSIGNAL);
+
+        if (sent > 0) {
+            total_sent += static_cast<std::size_t>(sent);
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent < 0) {
+            std::cerr << "send failed: " << std::strerror(errno) << '\n';
+        } else {
+            std::cerr << "send returned zero bytes\n";
+        }
+        return;
+    }
+}
 }  // namespace
 
 bool installSignalHandlers() {
@@ -225,85 +261,58 @@ void TcpServer::run() {
 }
 void TcpServer::handleClient(int client_fd) {
     SocketFd client_socket(client_fd);
-    char buffer[kRequestBufferSize];
+    std::string raw_request;
+    char buffer[kReadBufferSize];
 
-    ssize_t n;
-    do {
-        n = ::recv(client_socket.get(), buffer, sizeof(buffer) - 1, 0);
-    } while (n < 0 && errno == EINTR);
+    while (raw_request.find("\r\n\r\n") == std::string::npos) {
+        const ssize_t count =
+            ::recv(client_socket.get(), buffer, sizeof(buffer), 0);
 
-    if (n < 0) {
+        if (count > 0) {
+            raw_request.append(buffer, static_cast<std::size_t>(count));
+
+            const std::size_t header_end = raw_request.find("\r\n\r\n");
+            if ((header_end == std::string::npos &&
+                 raw_request.size() > kMaxHeaderSize) ||
+                (header_end != std::string::npos &&
+                 header_end + 4 > kMaxHeaderSize)) {
+                sendResponse(client_socket.get(), 400, "Bad Request",
+                             "Request header too large");
+                return;
+            }
+            continue;
+        }
+
+        if (count == 0) {
+            return;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+
         printError("recv");
         return;
     }
-    if (n == 0) {
+
+    std::cout << "Request:\n" << raw_request << '\n';
+
+    HttpRequest request;
+    const ParseResult result = parseRequest(raw_request, request);
+    if (result != ParseResult::Complete) {
+        sendResponse(client_socket.get(), 400, "Bad Request", "Bad Request");
         return;
     }
 
-    buffer[n] = '\0';
-    const std::string request(buffer, static_cast<std::size_t>(n));
-
-    std::cout << "Request:\n" << request << '\n';
-
-    const bool is_get = request.rfind("GET ", 0) == 0;
-
-    std::string body;
-    std::string response;
-
-    if (is_get) {
-        body =
-            "<!DOCTYPE html>"
-            "<html>"
-            "<head><meta charset=\"UTF-8\"><title>C++ Server</title></head>"
-            "<body>"
-            "<h1>Hello from C++ HTTP Server</h1>"
-            "<p>The server is running successfully.</p>"
-            "</body>"
-            "</html>";
-
-        response =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html; charset=UTF-8\r\n"
-            "Content-Length: " + std::to_string(body.size()) + "\r\n"
-            "Connection: close\r\n"
-            "\r\n" +
-            body;
+    if (request.method != "GET") {
+        sendResponse(client_socket.get(), 405, "Method Not Allowed",
+                     "Method Not Allowed");
+    } else if (request.path == "/") {
+        sendResponse(client_socket.get(), 200, "OK",
+                     "<h1>Hello from C++ HTTP Server</h1>");
     } else {
-        body = "Method Not Allowed";
-
-        response =
-            "HTTP/1.1 405 Method Not Allowed\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: " + std::to_string(body.size()) + "\r\n"
-            "Connection: close\r\n"
-            "\r\n" +
-            body;
-    }
-
-    std::size_t total_sent = 0;
-    while (total_sent < response.size()) {
-        const ssize_t sent = ::send(
-            client_socket.get(),
-            response.data() + total_sent,
-            response.size() - total_sent,
-            MSG_NOSIGNAL);
-
-        if (sent > 0) {
-            total_sent += static_cast<std::size_t>(sent);
-            continue;
-        }
-        if (sent < 0 && errno == EINTR) {
-            continue;
-        }
-        if (sent < 0) {
-            printError("send");
-        } else {
-            std::cerr << "send returned zero bytes\n";
-        }
-        break;
+        sendResponse(client_socket.get(), 404, "Not Found", "Not Found");
     }
 }
-
 void TcpServer::printError(const char* operation) {
     std::cerr << operation << " failed: " << std::strerror(errno) << '\n';
 }

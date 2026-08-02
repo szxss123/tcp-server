@@ -12,6 +12,7 @@ add_executable(tcp_server
     src/TcpServer.cpp
     src/ThreadPool.cpp
     src/SocketFd.cpp
+    src/HttpRequest.cpp
 )
 
 target_include_directories(tcp_server PRIVATE include)
