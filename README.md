@@ -78,6 +78,15 @@ for i in $(seq 1 10); do
 done
 ```
 
+## I/O模型
+
+服务器使用 epoll 监听网络事件：
+
+- 监听 Socket：非阻塞 + ET
+- 客户端 Socket：LT
+- HTTP处理：固定大小线程池
+- Socket资源：RAII自动管理
+
 ## 当前架构
 
 ```text

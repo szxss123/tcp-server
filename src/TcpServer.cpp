@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <fcntl.h>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -20,6 +21,15 @@ namespace {
 constexpr std::size_t kRequestBufferSize = 4096;
 
 volatile std::sig_atomic_t g_running = 1;
+
+bool setNonBlocking(int fd) {
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags == -1) {
+        return false;
+    }
+
+    return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
+}
 
 void handleSignal(int) {
     g_running = 0;
@@ -79,6 +89,11 @@ bool TcpServer::listenConnections() const {
         return false;
     }
 
+    if (!setNonBlocking(listen_socket_.get())) {
+        printError("setNonBlocking");
+        return false;
+    }
+
     std::cout << "TCP server is listening on 0.0.0.0:" << port_
               << " (press Ctrl+C to stop)" << std::endl;
     return true;
@@ -96,7 +111,7 @@ void TcpServer::run() {
     }
 
     epoll_event listen_event{};
-    listen_event.events = EPOLLIN;
+    listen_event.events = EPOLLIN | EPOLLET;
     listen_event.data.fd = listen_socket_.get();
 
     if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, listen_socket_.get(),
@@ -126,14 +141,24 @@ void TcpServer::run() {
             const std::uint32_t active_events = events[i].events;
 
             if (fd == listen_socket_.get()) {
-                if ((active_events & EPOLLIN) != 0) {
-                    SocketFd client_socket(
-                        ::accept(listen_socket_.get(), nullptr, nullptr));
+                if ((active_events & (EPOLLERR | EPOLLHUP)) != 0) {
+                    std::cerr
+                        << "listening socket reported an epoll error\n";
+                    return;
+                }
+
+                while (true) {
+                    SocketFd client_socket(::accept4(
+                        listen_socket_.get(), nullptr, nullptr, SOCK_CLOEXEC));
                     if (!client_socket.valid()) {
-                        if (errno != EINTR) {
-                            printError("accept");
+                        if (errno == EINTR) {
+                            continue;
                         }
-                        continue;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break;
+                        }
+                        printError("accept4");
+                        break;
                     }
 
                     const int client_fd = client_socket.get();
@@ -160,12 +185,6 @@ void TcpServer::run() {
 
                     std::cout << "client connected, fd="
                               << position->first << '\n';
-                }
-
-                if ((active_events & (EPOLLERR | EPOLLHUP)) != 0) {
-                    std::cerr
-                        << "listening socket reported an epoll error\n";
-                    return;
                 }
                 continue;
             }
