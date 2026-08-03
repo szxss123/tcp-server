@@ -41,7 +41,9 @@ void handleSignal(int) {
 bool installSignalHandler(int signal_number) {
     struct sigaction action {};
     action.sa_handler = handleSignal;
-    sigemptyset(&action.sa_mask);
+    if (::sigemptyset(&action.sa_mask) < 0) {
+        return false;
+    }
     action.sa_flags = 0;
     return ::sigaction(signal_number, &action, nullptr) == 0;
 }
@@ -214,8 +216,11 @@ void TcpServer::run() {
                     if (!inserted) {
                         std::cerr << "client fd is already registered: "
                                   << client_fd << '\n';
-                        ::epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL, client_fd,
-                                    nullptr);
+                        if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL,
+                                        client_fd, nullptr) < 0 &&
+                            errno != ENOENT) {
+                            printError("epoll_ctl DEL duplicate client");
+                        }
                         continue;
                     }
 
@@ -229,6 +234,8 @@ void TcpServer::run() {
                 if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL, fd, nullptr) <
                     0) {
                     printError("epoll_ctl DEL client");
+                    waiting_clients.erase(fd);
+                    continue;
                 }
 
                 auto client = waiting_clients.find(fd);

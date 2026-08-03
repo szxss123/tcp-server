@@ -1,5 +1,7 @@
 #include "SocketFd.h"
 
+#include <cstdio>
+
 #include <unistd.h>
 #include <utility>
 
@@ -32,8 +34,12 @@ int SocketFd::release() {
 }
 
 void SocketFd::reset(int new_fd) {
-    if (fd_ >= 0) {
-        ::close(fd_);
+    if (fd_ == new_fd) {
+        return;
     }
-    fd_ = new_fd;
+
+    const int old_fd = std::exchange(fd_, new_fd);
+    if (old_fd >= 0 && ::close(old_fd) < 0) {
+        std::perror("close");
+    }
 }
