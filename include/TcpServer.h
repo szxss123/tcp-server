@@ -5,6 +5,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
 
 bool installSignalHandlers();
 
@@ -22,7 +26,16 @@ public:
 private:
     static constexpr std::size_t kThreadCount = 4;
 
-    void handleClient(int client_fd);
+    struct Connection {
+        explicit Connection(SocketFd socket_fd)
+            : socket(std::move(socket_fd)) {}
+
+        SocketFd socket;
+        std::string input_buffer;
+    };
+
+    void handleReadable(int epoll_fd, int fd);
+    void closeConnection(int epoll_fd, int fd);
 
     bool createSocket();
     bool bindPort() const;
@@ -32,5 +45,8 @@ private:
 
     std::uint16_t port_;
     SocketFd listen_socket_;
+    SocketFd epoll_socket_;
+    std::unordered_map<int, Connection> connections_;
+    std::mutex connections_mutex_;
     ThreadPool thread_pool_{kThreadCount};
 };

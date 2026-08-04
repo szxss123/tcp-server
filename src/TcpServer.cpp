@@ -8,9 +8,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
-#include <memory>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -142,17 +140,18 @@ bool TcpServer::start() {
 }
 
 void TcpServer::run() {
-    SocketFd epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
-    if (!epoll_fd.valid()) {
+    epoll_socket_.reset(::epoll_create1(EPOLL_CLOEXEC));
+    if (!epoll_socket_.valid()) {
         printError("epoll_create1");
         return;
     }
+    const int epoll_fd = epoll_socket_.get();
 
     epoll_event listen_event{};
     listen_event.events = EPOLLIN | EPOLLET;
     listen_event.data.fd = listen_socket_.get();
 
-    if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, listen_socket_.get(),
+    if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_socket_.get(),
                     &listen_event) < 0) {
         printError("epoll_ctl ADD listen");
         return;
@@ -160,11 +159,10 @@ void TcpServer::run() {
 
     constexpr int kMaxEvents = 64;
     std::vector<epoll_event> events(kMaxEvents);
-    std::unordered_map<int, SocketFd> waiting_clients;
 
     while (g_running) {
-        const int ready_count = ::epoll_wait(
-            epoll_fd.get(), events.data(), kMaxEvents, -1);
+        const int ready_count =
+            ::epoll_wait(epoll_fd, events.data(), kMaxEvents, -1);
 
         if (ready_count < 0) {
             if (errno == EINTR) {
@@ -187,7 +185,8 @@ void TcpServer::run() {
 
                 while (true) {
                     SocketFd client_socket(::accept4(
-                        listen_socket_.get(), nullptr, nullptr, SOCK_CLOEXEC));
+                        listen_socket_.get(), nullptr, nullptr,
+                        SOCK_NONBLOCK | SOCK_CLOEXEC));
                     if (!client_socket.valid()) {
                         if (errno == EINTR) {
                             continue;
@@ -201,124 +200,193 @@ void TcpServer::run() {
 
                     const int client_fd = client_socket.get();
                     epoll_event client_event{};
-                    client_event.events = EPOLLIN | EPOLLRDHUP;
+                    client_event.events =
+                        EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
                     client_event.data.fd = client_fd;
 
-                    if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_ADD, client_fd,
+                    if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd,
                                     &client_event) < 0) {
                         printError("epoll_ctl ADD client");
                         continue;
                     }
 
-                    const auto [position, inserted] =
-                        waiting_clients.try_emplace(
-                            client_fd, std::move(client_socket));
+                    bool inserted = false;
+                    {
+                        std::lock_guard<std::mutex> lock(connections_mutex_);
+                        inserted = connections_
+                                       .try_emplace(
+                                           client_fd,
+                                           std::move(client_socket))
+                                       .second;
+                    }
+
                     if (!inserted) {
                         std::cerr << "client fd is already registered: "
                                   << client_fd << '\n';
-                        if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL,
-                                        client_fd, nullptr) < 0 &&
+                        if (::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd,
+                                        nullptr) < 0 &&
                             errno != ENOENT) {
                             printError("epoll_ctl DEL duplicate client");
                         }
                         continue;
                     }
 
-                    std::cout << "client connected, fd="
-                              << position->first << '\n';
+                    std::cout << "client connected, fd=" << client_fd << '\n';
                 }
                 continue;
             }
 
             if ((active_events & EPOLLIN) != 0) {
-                if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL, fd, nullptr) <
-                    0) {
-                    printError("epoll_ctl DEL client");
-                    waiting_clients.erase(fd);
+                bool registered = false;
+                {
+                    std::lock_guard<std::mutex> lock(connections_mutex_);
+                    registered = connections_.find(fd) != connections_.end();
+                }
+
+                if (!registered) {
+                    if (::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0 &&
+                        errno != ENOENT) {
+                        printError("epoll_ctl DEL stale client");
+                    }
                     continue;
                 }
 
-                auto client = waiting_clients.find(fd);
-                if (client == waiting_clients.end()) {
-                    std::cerr << "ready client fd is not registered: "
-                              << fd << '\n';
-                    continue;
-                }
-
-                const auto client_socket = std::make_shared<SocketFd>(
-                    std::move(client->second));
-                waiting_clients.erase(client);
-
-                thread_pool_.submit([this, client_socket] {
-                    handleClient(client_socket->release());
+                thread_pool_.submit([this, epoll_fd, fd] {
+                    handleReadable(epoll_fd, fd);
                 });
                 continue;
             }
 
             if ((active_events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0) {
-                if (::epoll_ctl(epoll_fd.get(), EPOLL_CTL_DEL, fd, nullptr) <
-                        0 &&
-                    errno != ENOENT) {
-                    printError("epoll_ctl DEL client");
-                }
-                waiting_clients.erase(fd);
+                closeConnection(epoll_fd, fd);
             }
         }
     }
 }
-void TcpServer::handleClient(int client_fd) {
-    SocketFd client_socket(client_fd);
-    std::string raw_request;
+void TcpServer::handleReadable(int epoll_fd, int fd) {
     char buffer[kReadBufferSize];
+    bool peer_closed = false;
+    bool read_failed = false;
 
-    while (raw_request.find("\r\n\r\n") == std::string::npos) {
-        const ssize_t count =
-            ::recv(client_socket.get(), buffer, sizeof(buffer), 0);
+    while (true) {
+        const ssize_t count = ::recv(fd, buffer, sizeof(buffer), 0);
 
         if (count > 0) {
-            raw_request.append(buffer, static_cast<std::size_t>(count));
+            bool request_ready = false;
+            bool header_too_large = false;
+            {
+                std::lock_guard<std::mutex> lock(connections_mutex_);
+                const auto connection = connections_.find(fd);
+                if (connection == connections_.end()) {
+                    return;
+                }
 
-            const std::size_t header_end = raw_request.find("\r\n\r\n");
-            if ((header_end == std::string::npos &&
-                 raw_request.size() > kMaxHeaderSize) ||
-                (header_end != std::string::npos &&
-                 header_end + 4 > kMaxHeaderSize)) {
-                sendResponse(client_socket.get(), 400, "Bad Request",
-                             "Request header too large");
-                return;
+                std::string& input_buffer = connection->second.input_buffer;
+                input_buffer.append(buffer, static_cast<std::size_t>(count));
+
+                const std::size_t header_end =
+                    input_buffer.find("\r\n\r\n");
+                request_ready = header_end != std::string::npos;
+                header_too_large =
+                    (request_ready && header_end + 4 > kMaxHeaderSize) ||
+                    (!request_ready &&
+                     input_buffer.size() > kMaxHeaderSize);
+            }
+
+            if (request_ready || header_too_large) {
+                break;
             }
             continue;
         }
 
         if (count == 0) {
-            return;
+            peer_closed = true;
+            break;
         }
         if (errno == EINTR) {
             continue;
         }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+        }
 
         printError("recv");
+        read_failed = true;
+        break;
+    }
+
+    std::string raw_request;
+    bool request_ready = false;
+    bool header_too_large = false;
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        const auto connection = connections_.find(fd);
+        if (connection == connections_.end()) {
+            return;
+        }
+
+        const std::string& input_buffer = connection->second.input_buffer;
+        const std::size_t header_end = input_buffer.find("\r\n\r\n");
+        request_ready = header_end != std::string::npos;
+        header_too_large =
+            (request_ready && header_end + 4 > kMaxHeaderSize) ||
+            (!request_ready && input_buffer.size() > kMaxHeaderSize);
+
+        if (request_ready && !header_too_large) {
+            raw_request = input_buffer;
+        }
+    }
+
+    if (header_too_large) {
+        sendResponse(fd, 400, "Bad Request", "Request header too large");
+        closeConnection(epoll_fd, fd);
         return;
     }
 
-    std::cout << "Request:\n" << raw_request << '\n';
+    if (request_ready) {
+        std::cout << "Request:\n" << raw_request << '\n';
 
-    HttpRequest request;
-    const ParseResult result = parseRequest(raw_request, request);
-    if (result != ParseResult::Complete) {
-        sendResponse(client_socket.get(), 400, "Bad Request", "Bad Request");
+        HttpRequest request;
+        const ParseResult result = parseRequest(raw_request, request);
+        if (result != ParseResult::Complete) {
+            sendResponse(fd, 400, "Bad Request", "Bad Request");
+        } else if (request.method != "GET") {
+            sendResponse(fd, 405, "Method Not Allowed",
+                         "Method Not Allowed");
+        } else if (request.path == "/") {
+            sendResponse(fd, 200, "OK",
+                         "<h1>Hello from C++ HTTP Server</h1>");
+        } else {
+            sendResponse(fd, 404, "Not Found", "Not Found");
+        }
+
+        closeConnection(epoll_fd, fd);
         return;
     }
 
-    if (request.method != "GET") {
-        sendResponse(client_socket.get(), 405, "Method Not Allowed",
-                     "Method Not Allowed");
-    } else if (request.path == "/") {
-        sendResponse(client_socket.get(), 200, "OK",
-                     "<h1>Hello from C++ HTTP Server</h1>");
-    } else {
-        sendResponse(client_socket.get(), 404, "Not Found", "Not Found");
+    if (peer_closed || read_failed) {
+        closeConnection(epoll_fd, fd);
+        return;
     }
+
+    epoll_event event{};
+    event.events = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
+    event.data.fd = fd;
+
+    if (::epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event) < 0) {
+        printError("epoll_ctl MOD client");
+        closeConnection(epoll_fd, fd);
+    }
+}
+
+void TcpServer::closeConnection(int epoll_fd, int fd) {
+    if (::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0 &&
+        errno != ENOENT) {
+        printError("epoll_ctl DEL client");
+    }
+
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    connections_.erase(fd);
 }
 void TcpServer::printError(const char* operation) {
     std::cerr << operation << " failed: " << std::strerror(errno) << '\n';
