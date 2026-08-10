@@ -26,15 +26,27 @@ public:
 private:
     static constexpr std::size_t kThreadCount = 4;
 
+    enum class ConnectionState {
+        Reading,
+        Writing,
+    };
+
     struct Connection {
         explicit Connection(SocketFd socket_fd)
             : socket(std::move(socket_fd)) {}
 
         SocketFd socket;
         std::string input_buffer;
+        std::string output_buffer;
+        std::size_t bytes_sent{0};
+        ConnectionState state{ConnectionState::Reading};
     };
 
     void handleReadable(int epoll_fd, int fd);
+    void handleWritable(int epoll_fd, int fd);
+    void queueResponse(int epoll_fd, int fd, std::string response);
+    void rearmRead(int epoll_fd, int fd);
+    void rearmWrite(int epoll_fd, int fd);
     void closeConnection(int epoll_fd, int fd);
 
     bool createSocket();
