@@ -14,12 +14,15 @@
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 namespace {
 
 constexpr std::size_t kMaxHeaderSize = 8192;
 constexpr std::size_t kReadBufferSize = 2048;
+constexpr std::chrono::seconds kIdleTimeout{30};
+constexpr std::chrono::seconds kTimeoutScanInterval{1};
 
 volatile std::sig_atomic_t g_running = 1;
 
@@ -140,6 +143,21 @@ void TcpServer::run() {
     }
     const int epoll_fd = epoll_socket_.get();
 
+    SocketFd timer_socket(
+        ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC));
+    if (!timer_socket.valid()) {
+        printError("timerfd_create");
+        return;
+    }
+
+    itimerspec timer_spec{};
+    timer_spec.it_value.tv_sec = kTimeoutScanInterval.count();
+    timer_spec.it_interval.tv_sec = kTimeoutScanInterval.count();
+    if (::timerfd_settime(timer_socket.get(), 0, &timer_spec, nullptr) < 0) {
+        printError("timerfd_settime");
+        return;
+    }
+
     epoll_event listen_event{};
     listen_event.events = EPOLLIN | EPOLLET;
     listen_event.data.fd = listen_socket_.get();
@@ -147,6 +165,15 @@ void TcpServer::run() {
     if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_socket_.get(),
                     &listen_event) < 0) {
         printError("epoll_ctl ADD listen");
+        return;
+    }
+
+    epoll_event timer_event{};
+    timer_event.events = EPOLLIN;
+    timer_event.data.fd = timer_socket.get();
+    if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_socket.get(),
+                    &timer_event) < 0) {
+        printError("epoll_ctl ADD timer");
         return;
     }
 
@@ -168,6 +195,34 @@ void TcpServer::run() {
         for (int i = 0; i < ready_count; ++i) {
             const int fd = events[i].data.fd;
             const std::uint32_t active_events = events[i].events;
+
+            if (fd == timer_socket.get()) {
+                std::uint64_t expirations = 0;
+                while (true) {
+                    const ssize_t count = ::read(
+                        timer_socket.get(), &expirations,
+                        sizeof(expirations));
+                    if (count == static_cast<ssize_t>(sizeof(expirations))) {
+                        closeIdleConnections(epoll_fd, kIdleTimeout);
+                        continue;
+                    }
+                    if (count < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    if (count < 0 &&
+                        (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        break;
+                    }
+
+                    if (count < 0) {
+                        printError("read timerfd");
+                    } else {
+                        std::cerr << "timerfd returned an invalid read size\n";
+                    }
+                    return;
+                }
+                continue;
+            }
 
             if (fd == listen_socket_.get()) {
                 if ((active_events & (EPOLLERR | EPOLLHUP)) != 0) {
@@ -206,11 +261,13 @@ void TcpServer::run() {
                     bool inserted = false;
                     {
                         std::lock_guard<std::mutex> lock(connections_mutex_);
-                        inserted = connections_
-                                       .try_emplace(
-                                           client_fd,
-                                           std::move(client_socket))
-                                       .second;
+                        const auto result = connections_.try_emplace(
+                            client_fd, std::move(client_socket));
+                        inserted = result.second;
+                        if (inserted) {
+                            result.first->second.last_active =
+                                std::chrono::steady_clock::now();
+                        }
                     }
 
                     if (!inserted) {
@@ -229,14 +286,35 @@ void TcpServer::run() {
                 continue;
             }
 
+            enum class PendingTask {
+                None,
+                Read,
+                Write,
+            };
+
             bool registered = false;
+            bool processing = false;
             ConnectionState state = ConnectionState::Reading;
+            PendingTask pending_task = PendingTask::None;
             {
                 std::lock_guard<std::mutex> lock(connections_mutex_);
                 const auto connection = connections_.find(fd);
                 if (connection != connections_.end()) {
                     registered = true;
                     state = connection->second.state;
+                    processing = connection->second.processing;
+
+                    if (!processing &&
+                        (active_events & EPOLLIN) != 0 &&
+                        state == ConnectionState::Reading) {
+                        connection->second.processing = true;
+                        pending_task = PendingTask::Read;
+                    } else if (!processing &&
+                               (active_events & EPOLLOUT) != 0 &&
+                               state == ConnectionState::Writing) {
+                        connection->second.processing = true;
+                        pending_task = PendingTask::Write;
+                    }
                 }
             }
 
@@ -248,19 +326,21 @@ void TcpServer::run() {
                 continue;
             }
 
-            if ((active_events & EPOLLIN) != 0 &&
-                state == ConnectionState::Reading) {
+            if (pending_task == PendingTask::Read) {
                 thread_pool_.submit([this, epoll_fd, fd] {
                     handleReadable(epoll_fd, fd);
                 });
                 continue;
             }
 
-            if ((active_events & EPOLLOUT) != 0 &&
-                state == ConnectionState::Writing) {
+            if (pending_task == PendingTask::Write) {
                 thread_pool_.submit([this, epoll_fd, fd] {
                     handleWritable(epoll_fd, fd);
                 });
+                continue;
+            }
+
+            if (processing) {
                 continue;
             }
 
@@ -298,6 +378,8 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
 
                 std::string& input_buffer = connection->second.input_buffer;
                 input_buffer.append(buffer, static_cast<std::size_t>(count));
+                connection->second.last_active =
+                    std::chrono::steady_clock::now();
 
                 const std::size_t header_end =
                     input_buffer.find("\r\n\r\n");
@@ -417,6 +499,8 @@ void TcpServer::handleWritable(int epoll_fd, int fd) {
                     if (count > 0) {
                         state.bytes_sent +=
                             static_cast<std::size_t>(count);
+                        state.last_active =
+                            std::chrono::steady_clock::now();
                     } else if (count < 0) {
                         send_error = errno;
                     }
@@ -483,7 +567,22 @@ void TcpServer::rearmRead(int epoll_fd, int fd) {
     event.events = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
     event.data.fd = fd;
 
-    if (::epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event) < 0) {
+    int control_error = 0;
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        const auto connection = connections_.find(fd);
+        if (connection == connections_.end()) {
+            return;
+        }
+
+        connection->second.processing = false;
+        if (::epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event) < 0) {
+            control_error = errno;
+        }
+    }
+
+    if (control_error != 0) {
+        errno = control_error;
         printError("epoll_ctl MOD read");
         closeConnection(epoll_fd, fd);
     }
@@ -494,20 +593,78 @@ void TcpServer::rearmWrite(int epoll_fd, int fd) {
     event.events = EPOLLOUT | EPOLLRDHUP | EPOLLONESHOT;
     event.data.fd = fd;
 
-    if (::epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event) < 0) {
+    int control_error = 0;
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        const auto connection = connections_.find(fd);
+        if (connection == connections_.end()) {
+            return;
+        }
+
+        connection->second.processing = false;
+        if (::epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event) < 0) {
+            control_error = errno;
+        }
+    }
+
+    if (control_error != 0) {
+        errno = control_error;
         printError("epoll_ctl MOD write");
         closeConnection(epoll_fd, fd);
     }
 }
 
+void TcpServer::closeIdleConnections(int epoll_fd,
+                                     std::chrono::seconds timeout) {
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<int> expired_fds;
+
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        for (const auto& [fd, connection] : connections_) {
+            if (!connection.processing &&
+                now - connection.last_active >= timeout) {
+                expired_fds.push_back(fd);
+            }
+        }
+    }
+
+    for (const int fd : expired_fds) {
+        bool should_close = false;
+        {
+            std::lock_guard<std::mutex> lock(connections_mutex_);
+            const auto connection = connections_.find(fd);
+            if (connection != connections_.end() &&
+                !connection->second.processing &&
+                now - connection->second.last_active >= timeout) {
+                connection->second.processing = true;
+                should_close = true;
+            }
+        }
+
+        if (should_close) {
+            closeConnection(epoll_fd, fd);
+        }
+    }
+}
+
 void TcpServer::closeConnection(int epoll_fd, int fd) {
+    SocketFd client_socket;
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        const auto connection = connections_.find(fd);
+        if (connection == connections_.end()) {
+            return;
+        }
+
+        client_socket = std::move(connection->second.socket);
+        connections_.erase(connection);
+    }
+
     if (::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0 &&
         errno != ENOENT) {
         printError("epoll_ctl DEL client");
     }
-
-    std::lock_guard<std::mutex> lock(connections_mutex_);
-    connections_.erase(fd);
 }
 void TcpServer::printError(const char* operation) {
     std::cerr << operation << " failed: " << std::strerror(errno) << '\n';

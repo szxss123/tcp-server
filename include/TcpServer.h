@@ -3,6 +3,7 @@
 #include "SocketFd.h"
 #include "ThreadPool.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -40,6 +41,9 @@ private:
         std::string output_buffer;
         std::size_t bytes_sent{0};
         ConnectionState state{ConnectionState::Reading};
+        std::chrono::steady_clock::time_point last_active{
+            std::chrono::steady_clock::now()};
+        bool processing{false};
     };
 
     void handleReadable(int epoll_fd, int fd);
@@ -47,6 +51,8 @@ private:
     void queueResponse(int epoll_fd, int fd, std::string response);
     void rearmRead(int epoll_fd, int fd);
     void rearmWrite(int epoll_fd, int fd);
+    void closeIdleConnections(int epoll_fd,
+                              std::chrono::seconds timeout);
     void closeConnection(int epoll_fd, int fd);
 
     bool createSocket();
