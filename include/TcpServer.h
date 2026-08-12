@@ -41,6 +41,8 @@ private:
         std::string output_buffer;
         std::size_t bytes_sent{0};
         ConnectionState state{ConnectionState::Reading};
+        bool keep_alive{false};
+        std::size_t requests_served{0};
         std::chrono::steady_clock::time_point last_active{
             std::chrono::steady_clock::now()};
         bool processing{false};
@@ -48,7 +50,10 @@ private:
 
     void handleReadable(int epoll_fd, int fd);
     void handleWritable(int epoll_fd, int fd);
-    void queueResponse(int epoll_fd, int fd, std::string response);
+    void queueResponse(int epoll_fd,
+                       int fd,
+                       std::string response,
+                       bool keep_alive);
     void rearmRead(int epoll_fd, int fd);
     void rearmWrite(int epoll_fd, int fd);
     void closeIdleConnections(int epoll_fd,

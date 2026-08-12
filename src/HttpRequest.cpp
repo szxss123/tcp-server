@@ -18,6 +18,15 @@ std::string trim(std::string_view value) {
     return std::string(value);
 }
 
+std::string normalizeHeader(std::string_view value) {
+    std::string normalized = trim(value);
+    for (char& character : normalized) {
+        character = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(character)));
+    }
+    return normalized;
+}
+
 }  // namespace
 
 ParseResult parseRequest(const std::string& raw_request,
@@ -57,6 +66,8 @@ ParseResult parseRequest(const std::string& raw_request,
         return ParseResult::Invalid;
     }
 
+    parsed.keep_alive = parsed.version == "HTTP/1.1";
+
     std::size_t line_start = request_line_end + 2;
     while (line_start < header_end) {
         const std::size_t line_end = raw_request.find("\r\n", line_start);
@@ -71,11 +82,20 @@ ParseResult parseRequest(const std::string& raw_request,
             return ParseResult::Invalid;
         }
 
-        const std::string name = trim(line.substr(0, colon));
+        const std::string name = normalizeHeader(line.substr(0, colon));
         if (name.empty()) {
             return ParseResult::Invalid;
         }
-        parsed.headers[name] = trim(line.substr(colon + 1));
+        const std::string value = normalizeHeader(line.substr(colon + 1));
+        parsed.headers[name] = value;
+
+        if (name == "connection") {
+            if (value == "close") {
+                parsed.keep_alive = false;
+            } else if (value == "keep-alive") {
+                parsed.keep_alive = true;
+            }
+        }
         line_start = line_end + 2;
     }
 

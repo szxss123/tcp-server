@@ -23,6 +23,7 @@ constexpr std::size_t kMaxHeaderSize = 8192;
 constexpr std::size_t kReadBufferSize = 2048;
 constexpr std::chrono::seconds kIdleTimeout{30};
 constexpr std::chrono::seconds kTimeoutScanInterval{1};
+constexpr std::size_t kMaxRequestsPerConnection = 100;
 
 volatile std::sig_atomic_t g_running = 1;
 
@@ -51,30 +52,34 @@ bool installSignalHandler(int signal_number) {
 
 std::string buildResponse(int status_code,
                           const std::string& reason,
-                          const std::string& body) {
+                          const std::string& body,
+                          bool keep_alive) {
     return "HTTP/1.1 " + std::to_string(status_code) + " " + reason + "\r\n"
            "Content-Type: text/html; charset=UTF-8\r\n"
            "Content-Length: " + std::to_string(body.size()) + "\r\n"
-           "Connection: close\r\n"
+           "Connection: " +
+           std::string(keep_alive ? "keep-alive" : "close") + "\r\n"
            "\r\n" +
            body;
 }
 
-std::string buildResponse(const HttpRequest& request) {
+std::string buildResponse(const HttpRequest& request, bool keep_alive) {
     if (request.method != "GET") {
         return buildResponse(405, "Method Not Allowed",
-                             "Method Not Allowed");
+                             "Method Not Allowed", keep_alive);
     }
     if (request.path == "/large") {
         constexpr std::size_t kLargeResponseSize = 1024 * 1024;
         return buildResponse(200, "OK",
-                             std::string(kLargeResponseSize, 'A'));
+                             std::string(kLargeResponseSize, 'A'),
+                             keep_alive);
     }
     if (request.path == "/") {
         return buildResponse(200, "OK",
-                             "<h1>Hello from C++ HTTP Server</h1>");
+                             "<h1>Hello from C++ HTTP Server</h1>",
+                             keep_alive);
     }
-    return buildResponse(404, "Not Found", "Not Found");
+    return buildResponse(404, "Not Found", "Not Found", keep_alive);
 }}  // namespace
 
 bool installSignalHandlers() {
@@ -415,6 +420,8 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
     std::string raw_request;
     bool request_ready = false;
     bool header_too_large = false;
+    bool pipelined_request = false;
+    std::size_t requests_served = 0;
     {
         std::lock_guard<std::mutex> lock(connections_mutex_);
         const auto connection = connections_.find(fd);
@@ -432,6 +439,8 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
 
         if (request_ready && !header_too_large) {
             raw_request = input_buffer;
+            pipelined_request = header_end + 4 < input_buffer.size();
+            requests_served = connection->second.requests_served;
         }
     }
 
@@ -439,7 +448,8 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
         queueResponse(
             epoll_fd, fd,
             buildResponse(400, "Bad Request",
-                          "Request header too large"));
+                          "Request header too large", false),
+            false);
         return;
     }
 
@@ -448,14 +458,18 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
 
         HttpRequest request;
         const ParseResult result = parseRequest(raw_request, request);
+        bool keep_alive = false;
         std::string response;
         if (result != ParseResult::Complete) {
-            response = buildResponse(400, "Bad Request", "Bad Request");
+            response = buildResponse(400, "Bad Request", "Bad Request",
+                                     false);
         } else {
-            response = buildResponse(request);
+            keep_alive = request.keep_alive && !pipelined_request &&
+                         requests_served + 1 < kMaxRequestsPerConnection;
+            response = buildResponse(request, keep_alive);
         }
 
-        queueResponse(epoll_fd, fd, std::move(response));
+        queueResponse(epoll_fd, fd, std::move(response), keep_alive);
         return;
     }
 
@@ -508,7 +522,44 @@ void TcpServer::handleWritable(int epoll_fd, int fd) {
             }
         }
 
-        if (invalid_state || finished || count == 0) {
+        if (invalid_state) {
+            closeConnection(epoll_fd, fd);
+            return;
+        }
+        if (finished) {
+            bool reuse_connection = false;
+            {
+                std::lock_guard<std::mutex> lock(connections_mutex_);
+                const auto connection = connections_.find(fd);
+                if (connection == connections_.end()) {
+                    return;
+                }
+
+                Connection& state = connection->second;
+                ++state.requests_served;
+                reuse_connection =
+                    state.keep_alive &&
+                    state.requests_served < kMaxRequestsPerConnection;
+
+                if (reuse_connection) {
+                    state.input_buffer.clear();
+                    state.output_buffer.clear();
+                    state.bytes_sent = 0;
+                    state.state = ConnectionState::Reading;
+                    state.keep_alive = false;
+                    state.last_active =
+                        std::chrono::steady_clock::now();
+                }
+            }
+
+            if (reuse_connection) {
+                rearmRead(epoll_fd, fd);
+            } else {
+                closeConnection(epoll_fd, fd);
+            }
+            return;
+        }
+        if (count == 0) {
             closeConnection(epoll_fd, fd);
             return;
         }
@@ -534,7 +585,8 @@ void TcpServer::handleWritable(int epoll_fd, int fd) {
 
 void TcpServer::queueResponse(int epoll_fd,
                               int fd,
-                              std::string response) {
+                              std::string response,
+                              bool keep_alive) {
     bool found = false;
     bool queued = false;
     {
@@ -547,6 +599,7 @@ void TcpServer::queueResponse(int epoll_fd,
                 state.output_buffer = std::move(response);
                 state.bytes_sent = 0;
                 state.state = ConnectionState::Writing;
+                state.keep_alive = keep_alive;
                 queued = true;
             }
         }

@@ -13,6 +13,7 @@ struct HttpRequest {
     std::string method;
     std::string path;
     std::string version;
+    bool keep_alive{false};
     std::unordered_map<std::string, std::string> headers;
 };
 
