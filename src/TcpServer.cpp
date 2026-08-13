@@ -7,8 +7,12 @@
 #include <csignal>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -24,6 +28,9 @@ constexpr std::size_t kReadBufferSize = 2048;
 constexpr std::chrono::seconds kIdleTimeout{30};
 constexpr std::chrono::seconds kTimeoutScanInterval{1};
 constexpr std::size_t kMaxRequestsPerConnection = 100;
+constexpr std::uintmax_t kMaxStaticFileSize = 1024 * 1024;
+
+namespace fs = std::filesystem;
 
 volatile std::sig_atomic_t g_running = 1;
 
@@ -52,10 +59,11 @@ bool installSignalHandler(int signal_number) {
 
 std::string buildResponse(int status_code,
                           const std::string& reason,
+                          const std::string& content_type,
                           const std::string& body,
                           bool keep_alive) {
     return "HTTP/1.1 " + std::to_string(status_code) + " " + reason + "\r\n"
-           "Content-Type: text/html; charset=UTF-8\r\n"
+           "Content-Type: " + content_type + "\r\n"
            "Content-Length: " + std::to_string(body.size()) + "\r\n"
            "Connection: " +
            std::string(keep_alive ? "keep-alive" : "close") + "\r\n"
@@ -63,23 +71,126 @@ std::string buildResponse(int status_code,
            body;
 }
 
+std::string buildErrorResponse(int status_code,
+                               const std::string& reason,
+                               bool keep_alive) {
+    return buildResponse(status_code, reason,
+                         "text/plain; charset=UTF-8", reason,
+                         keep_alive);
+}
+
+std::string contentTypeFor(const fs::path& file_path) {
+    const std::string extension = file_path.extension().string();
+    if (extension == ".html" || extension == ".htm") {
+        return "text/html; charset=UTF-8";
+    }
+    if (extension == ".css") {
+        return "text/css; charset=UTF-8";
+    }
+    if (extension == ".js") {
+        return "application/javascript; charset=UTF-8";
+    }
+    if (extension == ".json") {
+        return "application/json; charset=UTF-8";
+    }
+    if (extension == ".png") {
+        return "image/png";
+    }
+    if (extension == ".jpg" || extension == ".jpeg") {
+        return "image/jpeg";
+    }
+    if (extension == ".svg") {
+        return "image/svg+xml";
+    }
+    return "application/octet-stream";
+}
+
+std::optional<std::string> readFile(const fs::path& file_path,
+                                    std::uintmax_t max_size) {
+    std::error_code error;
+    if (!fs::is_regular_file(file_path, error) || error) {
+        return std::nullopt;
+    }
+
+    const std::uintmax_t file_size = fs::file_size(file_path, error);
+    if (error || file_size > max_size) {
+        return std::nullopt;
+    }
+
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file) {
+        return std::nullopt;
+    }
+
+    std::string content(static_cast<std::size_t>(file_size), '\0');
+    if (!content.empty()) {
+        file.read(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!file || file.gcount() !=
+                         static_cast<std::streamsize>(content.size())) {
+            return std::nullopt;
+        }
+    }
+    return content;
+}
+
+bool isWithinPublicRoot(const fs::path& public_root,
+                        const fs::path& file_path) {
+    std::error_code error;
+    const fs::path relative = fs::relative(file_path, public_root, error);
+    if (error || relative.empty() || relative.is_absolute()) {
+        return false;
+    }
+
+    for (const fs::path& component : relative) {
+        if (component == "..") {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::string buildResponse(const HttpRequest& request, bool keep_alive) {
     if (request.method != "GET") {
-        return buildResponse(405, "Method Not Allowed",
-                             "Method Not Allowed", keep_alive);
+        return buildErrorResponse(405, "Method Not Allowed", keep_alive);
     }
-    if (request.path == "/large") {
-        constexpr std::size_t kLargeResponseSize = 1024 * 1024;
-        return buildResponse(200, "OK",
-                             std::string(kLargeResponseSize, 'A'),
-                             keep_alive);
+
+    std::string request_path = request.path;
+    const std::size_t query_position = request_path.find('?');
+    if (query_position != std::string::npos) {
+        request_path.erase(query_position);
     }
-    if (request.path == "/") {
-        return buildResponse(200, "OK",
-                             "<h1>Hello from C++ HTTP Server</h1>",
-                             keep_alive);
+    if (request_path == "/") {
+        request_path = "/index.html";
     }
-    return buildResponse(404, "Not Found", "Not Found", keep_alive);
+
+    if (request_path.empty() || request_path.front() != '/' ||
+        request_path.find("..") != std::string::npos ||
+        request_path.find('%') != std::string::npos ||
+        request_path.find('\0') != std::string::npos) {
+        return buildErrorResponse(400, "Bad Request", keep_alive);
+    }
+
+    std::error_code error;
+    const fs::path public_root = fs::weakly_canonical("public", error);
+    if (error) {
+        return buildErrorResponse(500, "Internal Server Error", false);
+    }
+
+    const fs::path relative_path = request_path.substr(1);
+    const fs::path file_path =
+        fs::weakly_canonical(public_root / relative_path, error);
+    if (error || !isWithinPublicRoot(public_root, file_path)) {
+        return buildErrorResponse(403, "Forbidden", keep_alive);
+    }
+
+    std::optional<std::string> content =
+        readFile(file_path, kMaxStaticFileSize);
+    if (!content) {
+        return buildErrorResponse(404, "Not Found", keep_alive);
+    }
+
+    return buildResponse(200, "OK", contentTypeFor(file_path),
+                         *content, keep_alive);
 }}  // namespace
 
 bool installSignalHandlers() {
@@ -448,6 +559,7 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
         queueResponse(
             epoll_fd, fd,
             buildResponse(400, "Bad Request",
+                          "text/plain; charset=UTF-8",
                           "Request header too large", false),
             false);
         return;
@@ -461,8 +573,7 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
         bool keep_alive = false;
         std::string response;
         if (result != ParseResult::Complete) {
-            response = buildResponse(400, "Bad Request", "Bad Request",
-                                     false);
+            response = buildErrorResponse(400, "Bad Request", false);
         } else {
             keep_alive = request.keep_alive && !pipelined_request &&
                          requests_served + 1 < kMaxRequestsPerConnection;
