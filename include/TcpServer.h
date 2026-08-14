@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AsyncLogger.h"
 #include "SocketFd.h"
 #include "ThreadPool.h"
 
@@ -33,10 +34,12 @@ private:
     };
 
     struct Connection {
-        explicit Connection(SocketFd socket_fd)
-            : socket(std::move(socket_fd)) {}
+        Connection(SocketFd socket_fd, std::string remote_ip)
+            : socket(std::move(socket_fd)),
+              client_ip(std::move(remote_ip)) {}
 
         SocketFd socket;
+        std::string client_ip;
         std::string input_buffer;
         std::string output_buffer;
         std::size_t bytes_sent{0};
@@ -45,6 +48,12 @@ private:
         std::size_t requests_served{0};
         std::chrono::steady_clock::time_point last_active{
             std::chrono::steady_clock::now()};
+        std::chrono::steady_clock::time_point request_started{};
+        std::string log_method{"-"};
+        std::string log_path{"-"};
+        int response_status_code{0};
+        std::size_t response_bytes{0};
+        bool request_started_set{false};
         bool processing{false};
     };
 
@@ -53,7 +62,10 @@ private:
     void queueResponse(int epoll_fd,
                        int fd,
                        std::string response,
-                       bool keep_alive);
+                       bool keep_alive,
+                       int status_code,
+                       std::string method,
+                       std::string path);
     void rearmRead(int epoll_fd, int fd);
     void rearmWrite(int epoll_fd, int fd);
     void closeIdleConnections(int epoll_fd,
@@ -71,5 +83,6 @@ private:
     SocketFd epoll_socket_;
     std::unordered_map<int, Connection> connections_;
     std::mutex connections_mutex_;
+    AsyncLogger access_logger_{"logs/access.log", 4096};
     ThreadPool thread_pool_{kThreadCount};
 };

@@ -6,11 +6,14 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <ctime>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -45,6 +48,43 @@ bool setNonBlocking(int fd) {
 
 void handleSignal(int) {
     g_running = 0;
+}
+
+std::string currentTimestamp() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t time = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time{};
+    if (::localtime_r(&time, &local_time) == nullptr) {
+        return "unknown";
+    }
+
+    const auto milliseconds =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()) %
+        1000;
+    std::ostringstream timestamp;
+    timestamp << std::put_time(&local_time, "%Y-%m-%dT%H:%M:%S")
+              << '.' << std::setfill('0') << std::setw(3)
+              << milliseconds.count();
+    return timestamp.str();
+}
+
+std::string clientIpAddress(const sockaddr_storage& address) {
+    char text[INET6_ADDRSTRLEN]{};
+    const void* source = nullptr;
+
+    if (address.ss_family == AF_INET) {
+        source = &reinterpret_cast<const sockaddr_in*>(&address)->sin_addr;
+    } else if (address.ss_family == AF_INET6) {
+        source = &reinterpret_cast<const sockaddr_in6*>(&address)->sin6_addr;
+    } else {
+        return "unknown";
+    }
+
+    if (::inet_ntop(address.ss_family, source, text, sizeof(text)) == nullptr) {
+        return "unknown";
+    }
+    return text;
 }
 
 bool installSignalHandler(int signal_number) {
@@ -149,8 +189,11 @@ bool isWithinPublicRoot(const fs::path& public_root,
     return true;
 }
 
-std::string buildResponse(const HttpRequest& request, bool keep_alive) {
+std::string buildResponse(const HttpRequest& request,
+                          bool& keep_alive,
+                          int& status_code) {
     if (request.method != "GET") {
+        status_code = 405;
         return buildErrorResponse(405, "Method Not Allowed", keep_alive);
     }
 
@@ -167,12 +210,15 @@ std::string buildResponse(const HttpRequest& request, bool keep_alive) {
         request_path.find("..") != std::string::npos ||
         request_path.find('%') != std::string::npos ||
         request_path.find('\0') != std::string::npos) {
+        status_code = 400;
         return buildErrorResponse(400, "Bad Request", keep_alive);
     }
 
     std::error_code error;
     const fs::path public_root = fs::weakly_canonical("public", error);
     if (error) {
+        status_code = 500;
+        keep_alive = false;
         return buildErrorResponse(500, "Internal Server Error", false);
     }
 
@@ -180,15 +226,18 @@ std::string buildResponse(const HttpRequest& request, bool keep_alive) {
     const fs::path file_path =
         fs::weakly_canonical(public_root / relative_path, error);
     if (error || !isWithinPublicRoot(public_root, file_path)) {
+        status_code = 403;
         return buildErrorResponse(403, "Forbidden", keep_alive);
     }
 
     std::optional<std::string> content =
         readFile(file_path, kMaxStaticFileSize);
     if (!content) {
+        status_code = 404;
         return buildErrorResponse(404, "Not Found", keep_alive);
     }
 
+    status_code = 200;
     return buildResponse(200, "OK", contentTypeFor(file_path),
                          *content, keep_alive);
 }}  // namespace
@@ -248,7 +297,14 @@ bool TcpServer::listenConnections() const {
 }
 
 bool TcpServer::start() {
-    return createSocket() && bindPort() && listenConnections();
+    if (!createSocket() || !bindPort() || !listenConnections()) {
+        return false;
+    }
+    if (!access_logger_.start()) {
+        std::cerr << "failed to start access logger\n";
+        return false;
+    }
+    return true;
 }
 
 void TcpServer::run() {
@@ -348,8 +404,12 @@ void TcpServer::run() {
                 }
 
                 while (true) {
+                    sockaddr_storage client_address{};
+                    socklen_t client_address_length = sizeof(client_address);
                     SocketFd client_socket(::accept4(
-                        listen_socket_.get(), nullptr, nullptr,
+                        listen_socket_.get(),
+                        reinterpret_cast<sockaddr*>(&client_address),
+                        &client_address_length,
                         SOCK_NONBLOCK | SOCK_CLOEXEC));
                     if (!client_socket.valid()) {
                         if (errno == EINTR) {
@@ -378,7 +438,8 @@ void TcpServer::run() {
                     {
                         std::lock_guard<std::mutex> lock(connections_mutex_);
                         const auto result = connections_.try_emplace(
-                            client_fd, std::move(client_socket));
+                            client_fd, std::move(client_socket),
+                            clientIpAddress(client_address));
                         inserted = result.second;
                         if (inserted) {
                             result.first->second.last_active =
@@ -494,8 +555,12 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
 
                 std::string& input_buffer = connection->second.input_buffer;
                 input_buffer.append(buffer, static_cast<std::size_t>(count));
-                connection->second.last_active =
-                    std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+                connection->second.last_active = now;
+                if (!connection->second.request_started_set) {
+                    connection->second.request_started = now;
+                    connection->second.request_started_set = true;
+                }
 
                 const std::size_t header_end =
                     input_buffer.find("\r\n\r\n");
@@ -561,7 +626,7 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
             buildResponse(400, "Bad Request",
                           "text/plain; charset=UTF-8",
                           "Request header too large", false),
-            false);
+            false, 400, "-", "-");
         return;
     }
 
@@ -571,16 +636,22 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
         HttpRequest request;
         const ParseResult result = parseRequest(raw_request, request);
         bool keep_alive = false;
+        int status_code = 400;
+        std::string method = "-";
+        std::string path = "-";
         std::string response;
         if (result != ParseResult::Complete) {
             response = buildErrorResponse(400, "Bad Request", false);
         } else {
             keep_alive = request.keep_alive && !pipelined_request &&
                          requests_served + 1 < kMaxRequestsPerConnection;
-            response = buildResponse(request, keep_alive);
+            method = request.method;
+            path = request.path;
+            response = buildResponse(request, keep_alive, status_code);
         }
 
-        queueResponse(epoll_fd, fd, std::move(response), keep_alive);
+        queueResponse(epoll_fd, fd, std::move(response), keep_alive,
+                      status_code, std::move(method), std::move(path));
         return;
     }
 
@@ -639,6 +710,8 @@ void TcpServer::handleWritable(int epoll_fd, int fd) {
         }
         if (finished) {
             bool reuse_connection = false;
+            bool log_ready = false;
+            AccessLog access_log;
             {
                 std::lock_guard<std::mutex> lock(connections_mutex_);
                 const auto connection = connections_.find(fd);
@@ -647,6 +720,24 @@ void TcpServer::handleWritable(int epoll_fd, int fd) {
                 }
 
                 Connection& state = connection->second;
+                const auto completed_at = std::chrono::steady_clock::now();
+                if (state.response_status_code != 0) {
+                    access_log.client_ip = state.client_ip;
+                    access_log.method = state.log_method;
+                    access_log.path = state.log_path;
+                    access_log.status_code = state.response_status_code;
+                    access_log.response_bytes = state.response_bytes;
+                    if (state.request_started_set) {
+                        access_log.duration_us =
+                            std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                completed_at - state.request_started)
+                                .count();
+                    }
+                    state.response_status_code = 0;
+                    log_ready = true;
+                }
+
                 ++state.requests_served;
                 reuse_connection =
                     state.keep_alive &&
@@ -658,9 +749,17 @@ void TcpServer::handleWritable(int epoll_fd, int fd) {
                     state.bytes_sent = 0;
                     state.state = ConnectionState::Reading;
                     state.keep_alive = false;
-                    state.last_active =
-                        std::chrono::steady_clock::now();
+                    state.log_method = "-";
+                    state.log_path = "-";
+                    state.response_bytes = 0;
+                    state.request_started_set = false;
+                    state.last_active = completed_at;
                 }
+            }
+
+            if (log_ready) {
+                access_log.timestamp = currentTimestamp();
+                access_logger_.log(std::move(access_log));
             }
 
             if (reuse_connection) {
@@ -697,7 +796,10 @@ void TcpServer::handleWritable(int epoll_fd, int fd) {
 void TcpServer::queueResponse(int epoll_fd,
                               int fd,
                               std::string response,
-                              bool keep_alive) {
+                              bool keep_alive,
+                              int status_code,
+                              std::string method,
+                              std::string path) {
     bool found = false;
     bool queued = false;
     {
@@ -711,6 +813,10 @@ void TcpServer::queueResponse(int epoll_fd,
                 state.bytes_sent = 0;
                 state.state = ConnectionState::Writing;
                 state.keep_alive = keep_alive;
+                state.log_method = std::move(method);
+                state.log_path = std::move(path);
+                state.response_status_code = status_code;
+                state.response_bytes = state.output_buffer.size();
                 queued = true;
             }
         }

@@ -19,6 +19,7 @@
 - MIME 类型识别
 - 路径穿越防护
 - 单文件 1MB 大小限制
+- 有界队列异步访问日志
 ## 项目结构
 
 ```text
@@ -29,11 +30,13 @@ tcp-server/
 │   ├── index.html
 │   └── style.css
 ├── include/
+│   ├── AsyncLogger.h
 │   ├── HttpRequest.h
 │   ├── SocketFd.h
 │   ├── TcpServer.h
 │   └── ThreadPool.h
 └── src/
+    ├── AsyncLogger.cpp
     ├── HttpRequest.cpp
     ├── SocketFd.cpp
     ├── main.cpp
@@ -111,8 +114,10 @@ epoll 事件循环
 路径规范化与边界检查 → MIME 识别 → 文件大小检查
   ↓
 200 / 400 / 403 / 404 / 405 响应
-  ↓
-SocketFd 自动释放描述符
+  ├→ 非阻塞发送 → SocketFd 自动释放或 Keep-Alive 复用
+  └→ 访问日志记录 → 有界队列
+                         ↓
+                    独立日志线程 → logs/access.log
 ```
 
 监听 Socket 使用非阻塞 ET 模式并在事件到达后循环调用 accept4，直至返回 EAGAIN。客户端 Socket 保持 LT 模式，可读后先从 epoll 移除，再交给固定大小线程池。工作线程累计读取请求头并调用独立解析器，响应完成后由 SocketFd 自动关闭连接描述符。
@@ -130,3 +135,4 @@ SocketFd 自动释放描述符
 - 基于 C++17 与 Linux Socket 实现 HTTP 服务器，使用 epoll 完成 I/O 事件分发，并采用非阻塞 ET 模式批量接收突发连接。
 - 设计固定大小线程池和可移动的 Socket RAII 封装，实现 HTTP 请求分片累积、请求行解析及 200、400、404、405 响应，完成 500 次并发请求测试。
 - 实现安全的静态资源服务，基于 std::filesystem 完成路径规范化和文件类型识别，并通过路径穿越校验及文件大小限制降低异常访问风险。
+- 设计有界队列异步访问日志模块，通过条件变量和独立消费线程批量落盘，降低磁盘 I/O 对网络工作线程的阻塞，并对队列溢出进行统计与降级处理。
