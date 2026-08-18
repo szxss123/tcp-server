@@ -6,6 +6,9 @@
 #include <iostream>
 #include <string>
 
+#include <pthread.h>
+#include <signal.h>
+
 namespace {
 
 constexpr std::uint16_t kDefaultPort = 8080;
@@ -35,8 +38,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!installSignalHandlers()) {
-        std::cerr << "sigaction failed: " << std::strerror(errno) << '\n';
+    sigset_t signal_mask;
+    if (::sigemptyset(&signal_mask) < 0 ||
+        ::sigaddset(&signal_mask, SIGINT) < 0 ||
+        ::sigaddset(&signal_mask, SIGTERM) < 0) {
+        std::cerr << "failed to prepare signal mask: "
+                  << std::strerror(errno) << '\n';
+        return 1;
+    }
+
+    const int mask_error = ::pthread_sigmask(
+        SIG_BLOCK, &signal_mask, nullptr);
+    if (mask_error != 0) {
+        std::cerr << "failed to block signals: "
+                  << std::strerror(mask_error) << '\n';
         return 1;
     }
 

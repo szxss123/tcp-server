@@ -4,7 +4,6 @@
 
 #include <arpa/inet.h>
 #include <cerrno>
-#include <csignal>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
@@ -19,7 +18,10 @@
 #include <utility>
 #include <vector>
 
+#include <signal.h>
+
 #include <sys/epoll.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
@@ -35,8 +37,6 @@ constexpr std::uintmax_t kMaxStaticFileSize = 1024 * 1024;
 
 namespace fs = std::filesystem;
 
-volatile std::sig_atomic_t g_running = 1;
-
 bool setNonBlocking(int fd) {
     const int flags = ::fcntl(fd, F_GETFL, 0);
     if (flags == -1) {
@@ -44,10 +44,6 @@ bool setNonBlocking(int fd) {
     }
 
     return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
-}
-
-void handleSignal(int) {
-    g_running = 0;
 }
 
 std::string currentTimestamp() {
@@ -85,16 +81,6 @@ std::string clientIpAddress(const sockaddr_storage& address) {
         return "unknown";
     }
     return text;
-}
-
-bool installSignalHandler(int signal_number) {
-    struct sigaction action {};
-    action.sa_handler = handleSignal;
-    if (::sigemptyset(&action.sa_mask) < 0) {
-        return false;
-    }
-    action.sa_flags = 0;
-    return ::sigaction(signal_number, &action, nullptr) == 0;
 }
 
 std::string buildResponse(int status_code,
@@ -242,11 +228,11 @@ std::string buildResponse(const HttpRequest& request,
                          *content, keep_alive);
 }}  // namespace
 
-bool installSignalHandlers() {
-    return installSignalHandler(SIGINT) && installSignalHandler(SIGTERM);
-}
-
 TcpServer::TcpServer(std::uint16_t port) : port_(port) {}
+
+TcpServer::~TcpServer() {
+    shutdown();
+}
 
 bool TcpServer::createSocket() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -330,6 +316,21 @@ void TcpServer::run() {
         return;
     }
 
+    sigset_t signal_mask;
+    if (::sigemptyset(&signal_mask) < 0 ||
+        ::sigaddset(&signal_mask, SIGINT) < 0 ||
+        ::sigaddset(&signal_mask, SIGTERM) < 0) {
+        printError("prepare signalfd mask");
+        return;
+    }
+
+    SocketFd signal_socket(::signalfd(
+        -1, &signal_mask, SFD_NONBLOCK | SFD_CLOEXEC));
+    if (!signal_socket.valid()) {
+        printError("signalfd");
+        return;
+    }
+
     epoll_event listen_event{};
     listen_event.events = EPOLLIN | EPOLLET;
     listen_event.data.fd = listen_socket_.get();
@@ -349,10 +350,20 @@ void TcpServer::run() {
         return;
     }
 
+    epoll_event signal_event{};
+    signal_event.events = EPOLLIN;
+    signal_event.data.fd = signal_socket.get();
+    if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, signal_socket.get(),
+                    &signal_event) < 0) {
+        printError("epoll_ctl ADD signalfd");
+        return;
+    }
+
     constexpr int kMaxEvents = 64;
     std::vector<epoll_event> events(kMaxEvents);
 
-    while (g_running) {
+    bool running = true;
+    while (running) {
         const int ready_count =
             ::epoll_wait(epoll_fd, events.data(), kMaxEvents, -1);
 
@@ -367,6 +378,52 @@ void TcpServer::run() {
         for (int i = 0; i < ready_count; ++i) {
             const int fd = events[i].data.fd;
             const std::uint32_t active_events = events[i].events;
+
+            if (fd == signal_socket.get()) {
+                bool stop_requested = false;
+                while (true) {
+                    signalfd_siginfo signal_info{};
+                    const ssize_t count = ::read(
+                        signal_socket.get(), &signal_info,
+                        sizeof(signal_info));
+                    if (count ==
+                        static_cast<ssize_t>(sizeof(signal_info))) {
+                        if (signal_info.ssi_signo == SIGINT ||
+                            signal_info.ssi_signo == SIGTERM) {
+                            stop_requested = true;
+                        }
+                        continue;
+                    }
+                    if (count < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    if (count < 0 &&
+                        (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        break;
+                    }
+
+                    if (count < 0) {
+                        printError("read signalfd");
+                    } else {
+                        std::cerr
+                            << "signalfd returned an invalid read size\n";
+                    }
+                    stop_requested = true;
+                    break;
+                }
+
+                if (stop_requested) {
+                    stopping_.store(true, std::memory_order_release);
+                    if (::epoll_ctl(epoll_fd, EPOLL_CTL_DEL,
+                                    listen_socket_.get(), nullptr) < 0 &&
+                        errno != ENOENT) {
+                        printError("epoll_ctl DEL listen");
+                    }
+                    running = false;
+                    break;
+                }
+                continue;
+            }
 
             if (fd == timer_socket.get()) {
                 std::uint64_t expirations = 0;
@@ -533,6 +590,7 @@ void TcpServer::run() {
             }
         }
     }
+    shutdown();
 }
 void TcpServer::handleReadable(int epoll_fd, int fd) {
     char buffer[kReadBufferSize];
@@ -845,6 +903,9 @@ void TcpServer::rearmRead(int epoll_fd, int fd) {
             return;
         }
 
+        if (stopping_.load(std::memory_order_acquire)) {
+            return;
+        }
         connection->second.processing = false;
         if (::epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event) < 0) {
             control_error = errno;
@@ -871,6 +932,9 @@ void TcpServer::rearmWrite(int epoll_fd, int fd) {
             return;
         }
 
+        if (stopping_.load(std::memory_order_acquire)) {
+            return;
+        }
         connection->second.processing = false;
         if (::epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event) < 0) {
             control_error = errno;
@@ -931,11 +995,41 @@ void TcpServer::closeConnection(int epoll_fd, int fd) {
         connections_.erase(connection);
     }
 
-    if (::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0 &&
+    if (epoll_fd >= 0 &&
+        ::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0 &&
         errno != ENOENT) {
         printError("epoll_ctl DEL client");
     }
 }
+
+void TcpServer::closeAllConnections(int epoll_fd) {
+    std::vector<int> client_fds;
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        client_fds.reserve(connections_.size());
+        for (const auto& connection : connections_) {
+            client_fds.push_back(connection.first);
+        }
+    }
+
+    for (const int fd : client_fds) {
+        closeConnection(epoll_fd, fd);
+    }
+}
+
+void TcpServer::shutdown() {
+    std::call_once(shutdown_once_, [this] {
+        stopping_.store(true, std::memory_order_release);
+
+        thread_pool_.shutdown();
+        closeAllConnections(epoll_socket_.get());
+        access_logger_.stop();
+
+        epoll_socket_.reset();
+        listen_socket_.reset();
+    });
+}
+
 void TcpServer::printError(const char* operation) {
     std::cerr << operation << " failed: " << std::strerror(errno) << '\n';
 }

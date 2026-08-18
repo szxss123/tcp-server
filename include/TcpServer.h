@@ -4,6 +4,7 @@
 #include "SocketFd.h"
 #include "ThreadPool.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -12,12 +13,10 @@
 #include <unordered_map>
 #include <utility>
 
-bool installSignalHandlers();
-
 class TcpServer {
 public:
     explicit TcpServer(std::uint16_t port);
-    ~TcpServer() = default;
+    ~TcpServer();
 
     TcpServer(const TcpServer&) = delete;
     TcpServer& operator=(const TcpServer&) = delete;
@@ -71,6 +70,8 @@ private:
     void closeIdleConnections(int epoll_fd,
                               std::chrono::seconds timeout);
     void closeConnection(int epoll_fd, int fd);
+    void closeAllConnections(int epoll_fd);
+    void shutdown();
 
     bool createSocket();
     bool bindPort() const;
@@ -83,6 +84,8 @@ private:
     SocketFd epoll_socket_;
     std::unordered_map<int, Connection> connections_;
     std::mutex connections_mutex_;
+    std::once_flag shutdown_once_;
+    std::atomic<bool> stopping_{false};
     AsyncLogger access_logger_{"logs/access.log", 4096};
     ThreadPool thread_pool_{kThreadCount};
 };

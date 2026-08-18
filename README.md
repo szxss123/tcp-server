@@ -20,6 +20,8 @@
 - 路径穿越防护
 - 单文件 1MB 大小限制
 - 有界队列异步访问日志
+- 基于 signalfd 的 SIGINT/SIGTERM 优雅停机
+
 ## 项目结构
 
 ```text
@@ -60,6 +62,32 @@ cmake --build build
 ```bash
 ./build/tcp_server 9000
 ```
+
+### 启动与停止
+
+前台启动后，可直接按 `Ctrl+C`。服务器通过 signalfd 接收 `SIGINT`，不会在异步信号处理器中执行清理操作：
+
+```bash
+./build/tcp_server
+```
+
+后台运行时，可以向进程发送 `SIGTERM`：
+
+```bash
+./build/tcp_server > /tmp/tcp-server.log 2>&1 &
+PID="$!"
+kill -TERM "$PID"
+wait "$PID"
+```
+
+也可以查找正在运行的服务进程后停止：
+
+```bash
+PID="$(pgrep -n tcp_server)"
+kill -TERM "$PID"
+```
+
+收到 `SIGINT` 或 `SIGTERM` 后，服务器停止接受新连接，退出 epoll 事件循环，等待线程池中已经入队的任务完成，关闭剩余客户端连接，刷新并停止异步日志线程，最后释放 timerfd、signalfd、epoll 和监听 Socket。
 
 浏览器访问：
 
@@ -126,7 +154,6 @@ epoll 事件循环
 - 继续完善 HTTP 请求头语义校验，并支持请求体解析
 - 支持更多 MIME 类型、缓存控制和条件请求
 - 增加连接与读取超时，完善异常请求处理
-- 完善优雅停机，主动关闭仍在处理的客户端连接
 - 增加自动化单元测试、集成测试和结构化日志
 - 根据压力测试结果优化任务队列和线程池策略
 

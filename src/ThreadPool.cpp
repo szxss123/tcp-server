@@ -42,16 +42,22 @@ void ThreadPool::submit(std::function<void()> task) {
 }
 
 ThreadPool::~ThreadPool() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stopping_ = true;
-    }
+    shutdown();
+}
 
-    condition_.notify_all();
-
-    for (auto& worker : workers_) {
-        if (worker.joinable()) {
-            worker.join();
+void ThreadPool::shutdown() {
+    std::call_once(shutdown_once_, [this] {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
         }
-    }
+
+        condition_.notify_all();
+
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    });
 }

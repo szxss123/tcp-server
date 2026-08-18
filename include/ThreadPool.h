@@ -17,6 +17,7 @@ public:
     ThreadPool& operator=(const ThreadPool&) = delete;
 
     void submit(std::function<void()> task);
+    void shutdown();
 
 private:
     std::vector<std::thread> workers_;
@@ -24,5 +25,6 @@ private:
 
     std::mutex mutex_;
     std::condition_variable condition_;
+    std::once_flag shutdown_once_;
     bool stopping_{false};
 };
