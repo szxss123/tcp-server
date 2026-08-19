@@ -13,6 +13,15 @@
 #include <unordered_map>
 #include <utility>
 
+struct ServerMetrics {
+    std::atomic<std::uint64_t> total_requests{0};
+    std::atomic<std::uint64_t> active_connections{0};
+    std::atomic<std::uint64_t> total_connections{0};
+    std::atomic<std::uint64_t> total_bytes_sent{0};
+    std::atomic<std::uint64_t> client_errors{0};
+    std::atomic<std::uint64_t> server_errors{0};
+};
+
 class TcpServer {
 public:
     explicit TcpServer(std::uint16_t port);
@@ -72,6 +81,7 @@ private:
     void closeConnection(int epoll_fd, int fd);
     void closeAllConnections(int epoll_fd);
     void shutdown();
+    std::string buildMetricsBody() const;
 
     bool createSocket();
     bool bindPort() const;
@@ -86,6 +96,7 @@ private:
     std::mutex connections_mutex_;
     std::once_flag shutdown_once_;
     std::atomic<bool> stopping_{false};
+    ServerMetrics metrics_;
     AsyncLogger access_logger_{"logs/access.log", 4096};
     ThreadPool thread_pool_{kThreadCount};
 };

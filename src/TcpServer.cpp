@@ -501,6 +501,10 @@ void TcpServer::run() {
                         if (inserted) {
                             result.first->second.last_active =
                                 std::chrono::steady_clock::now();
+                            metrics_.total_connections.fetch_add(
+                                1, std::memory_order_relaxed);
+                            metrics_.active_connections.fetch_add(
+                                1, std::memory_order_relaxed);
                         }
                     }
 
@@ -514,7 +518,6 @@ void TcpServer::run() {
                         }
                         continue;
                     }
-
                     std::cout << "client connected, fd=" << client_fd << '\n';
                 }
                 continue;
@@ -701,11 +704,28 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
         if (result != ParseResult::Complete) {
             response = buildErrorResponse(400, "Bad Request", false);
         } else {
+            metrics_.total_requests.fetch_add(
+                1, std::memory_order_relaxed);
             keep_alive = request.keep_alive && !pipelined_request &&
                          requests_served + 1 < kMaxRequestsPerConnection;
             method = request.method;
             path = request.path;
-            response = buildResponse(request, keep_alive, status_code);
+
+            std::string route_path = request.path;
+            const std::size_t query_position = route_path.find('?');
+            if (query_position != std::string::npos) {
+                route_path.erase(query_position);
+            }
+
+            if (request.method == "GET" && route_path == "/metrics") {
+                status_code = 200;
+                response = buildResponse(
+                    200, "OK", "text/plain; charset=UTF-8",
+                    buildMetricsBody(), keep_alive);
+            } else {
+                response = buildResponse(
+                    request, keep_alive, status_code);
+            }
         }
 
         queueResponse(epoll_fd, fd, std::move(response), keep_alive,
@@ -760,6 +780,12 @@ void TcpServer::handleWritable(int epoll_fd, int fd) {
                     }
                 }
             }
+        }
+
+        if (count > 0) {
+            metrics_.total_bytes_sent.fetch_add(
+                static_cast<std::uint64_t>(count),
+                std::memory_order_relaxed);
         }
 
         if (invalid_state) {
@@ -887,6 +913,15 @@ void TcpServer::queueResponse(int epoll_fd,
         closeConnection(epoll_fd, fd);
         return;
     }
+
+    if (status_code == 400 || status_code == 404 ||
+        status_code == 405) {
+        metrics_.client_errors.fetch_add(
+            1, std::memory_order_relaxed);
+    } else if (status_code >= 500) {
+        metrics_.server_errors.fetch_add(
+            1, std::memory_order_relaxed);
+    }
     rearmWrite(epoll_fd, fd);
 }
 
@@ -995,6 +1030,9 @@ void TcpServer::closeConnection(int epoll_fd, int fd) {
         connections_.erase(connection);
     }
 
+    metrics_.active_connections.fetch_sub(
+        1, std::memory_order_relaxed);
+
     if (epoll_fd >= 0 &&
         ::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0 &&
         errno != ENOENT) {
@@ -1015,6 +1053,30 @@ void TcpServer::closeAllConnections(int epoll_fd) {
     for (const int fd : client_fds) {
         closeConnection(epoll_fd, fd);
     }
+}
+
+std::string TcpServer::buildMetricsBody() const {
+    std::ostringstream output;
+    output
+        << "tcp_server_total_requests "
+        << metrics_.total_requests.load(std::memory_order_relaxed)
+        << '\n'
+        << "tcp_server_active_connections "
+        << metrics_.active_connections.load(std::memory_order_relaxed)
+        << '\n'
+        << "tcp_server_total_connections "
+        << metrics_.total_connections.load(std::memory_order_relaxed)
+        << '\n'
+        << "tcp_server_bytes_sent_total "
+        << metrics_.total_bytes_sent.load(std::memory_order_relaxed)
+        << '\n'
+        << "tcp_server_client_errors_total "
+        << metrics_.client_errors.load(std::memory_order_relaxed)
+        << '\n'
+        << "tcp_server_server_errors_total "
+        << metrics_.server_errors.load(std::memory_order_relaxed)
+        << '\n';
+    return output.str();
 }
 
 void TcpServer::shutdown() {
