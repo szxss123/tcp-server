@@ -16,9 +16,10 @@
 - 8KB 请求头大小限制
 - HTTP/1.1 Keep-Alive 与空闲连接超时
 - 静态 HTML/CSS 文件服务
+- 小文件缓冲发送与大文件非阻塞 sendfile 发送
 - MIME 类型识别
 - 路径穿越防护
-- 单文件 1MB 大小限制
+- 单文件 16MB 大小限制
 - 有界队列异步访问日志
 - 基于 signalfd 的 SIGINT/SIGTERM 优雅停机
 - 基于 std::atomic 的线程安全运行指标与 `GET /metrics`
@@ -133,7 +134,7 @@ curl -s http://127.0.0.1:8080/metrics
 | `tcp_server_total_requests` | 成功解析出的完整 HTTP 请求总数，包含 `/metrics` 请求本身 |
 | `tcp_server_active_connections` | 当前仍在连接状态表中的客户端连接数 |
 | `tcp_server_total_connections` | 成功加入连接状态表的客户端连接累计数 |
-| `tcp_server_bytes_sent_total` | 所有成功 `send()` 调用实际发送的累计字节数 |
+| `tcp_server_bytes_sent_total` | 所有成功 `send()` 和 `sendfile()` 调用实际发送的累计字节数 |
 | `tcp_server_client_errors_total` | 已生成的 400、404 和 405 响应累计数 |
 | `tcp_server_server_errors_total` | 内部错误或 500 响应累计数 |
 
@@ -147,6 +148,7 @@ curl -s http://127.0.0.1:8080/metrics
 - 客户端 Socket：LT
 - HTTP处理：固定大小线程池
 - Socket资源：RAII自动管理
+- 静态文件：小文件读入缓冲区，256KB 及以上文件使用 sendfile
 
 ## 当前架构
 
@@ -164,7 +166,7 @@ epoll 事件循环
 路径规范化与边界检查 → MIME 识别 → 文件大小检查
   ↓
 200 / 400 / 403 / 404 / 405 响应
-  ├→ 非阻塞发送 → SocketFd 自动释放或 Keep-Alive 复用
+  ├→ 小文件 send / 大文件 sendfile → SocketFd 自动释放或 Keep-Alive 复用
   └→ 访问日志记录 → 有界队列
                          ↓
                     独立日志线程 → logs/access.log
@@ -184,5 +186,6 @@ epoll 事件循环
 - 基于 C++17 与 Linux Socket 实现 HTTP 服务器，使用 epoll 完成 I/O 事件分发，并采用非阻塞 ET 模式批量接收突发连接。
 - 设计固定大小线程池和可移动的 Socket RAII 封装，实现 HTTP 请求分片累积、请求行解析及 200、400、404、405 响应，完成 500 次并发请求测试。
 - 实现安全的静态资源服务，基于 std::filesystem 完成路径规范化和文件类型识别，并通过路径穿越校验及文件大小限制降低异常访问风险。
+- 基于非阻塞 sendfile 实现大文件零拷贝传输，通过连接状态保存文件偏移和剩余字节，正确处理部分发送、EAGAIN、慢客户端及异常断开。
 - 设计有界队列异步访问日志模块，通过条件变量和独立消费线程批量落盘，降低磁盘 I/O 对网络工作线程的阻塞，并对队列溢出进行统计与降级处理。
 - 使用 std::atomic 实现低开销运行指标统计，提供请求量、活跃连接、发送字节及错误计数接口，并通过统一连接回收保证并发场景下指标一致性。

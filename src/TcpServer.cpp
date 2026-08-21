@@ -8,7 +8,6 @@
 #include <ctime>
 #include <fcntl.h>
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <optional>
@@ -21,8 +20,10 @@
 #include <signal.h>
 
 #include <sys/epoll.h>
+#include <sys/sendfile.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -33,7 +34,8 @@ constexpr std::size_t kReadBufferSize = 2048;
 constexpr std::chrono::seconds kIdleTimeout{30};
 constexpr std::chrono::seconds kTimeoutScanInterval{1};
 constexpr std::size_t kMaxRequestsPerConnection = 100;
-constexpr std::uintmax_t kMaxStaticFileSize = 1024 * 1024;
+constexpr std::size_t kSendfileThreshold = 256 * 1024;
+constexpr std::size_t kMaxStaticFileSize = 16 * 1024 * 1024;
 
 namespace fs = std::filesystem;
 
@@ -83,17 +85,26 @@ std::string clientIpAddress(const sockaddr_storage& address) {
     return text;
 }
 
+std::string buildResponseHeader(int status_code,
+                                const std::string& reason,
+                                const std::string& content_type,
+                                std::size_t content_length,
+                                bool keep_alive) {
+    return "HTTP/1.1 " + std::to_string(status_code) + " " + reason + "\r\n"
+           "Content-Type: " + content_type + "\r\n"
+           "Content-Length: " + std::to_string(content_length) + "\r\n"
+           "Connection: " +
+           std::string(keep_alive ? "keep-alive" : "close") + "\r\n"
+           "\r\n";
+}
+
 std::string buildResponse(int status_code,
                           const std::string& reason,
                           const std::string& content_type,
                           const std::string& body,
                           bool keep_alive) {
-    return "HTTP/1.1 " + std::to_string(status_code) + " " + reason + "\r\n"
-           "Content-Type: " + content_type + "\r\n"
-           "Content-Length: " + std::to_string(body.size()) + "\r\n"
-           "Connection: " +
-           std::string(keep_alive ? "keep-alive" : "close") + "\r\n"
-           "\r\n" +
+    return buildResponseHeader(status_code, reason, content_type,
+                               body.size(), keep_alive) +
            body;
 }
 
@@ -131,31 +142,23 @@ std::string contentTypeFor(const fs::path& file_path) {
     return "application/octet-stream";
 }
 
-std::optional<std::string> readFile(const fs::path& file_path,
-                                    std::uintmax_t max_size) {
-    std::error_code error;
-    if (!fs::is_regular_file(file_path, error) || error) {
-        return std::nullopt;
-    }
+std::optional<std::string> readFile(int fd, std::size_t file_size) {
+    std::string content(file_size, '\0');
+    std::size_t total_read = 0;
 
-    const std::uintmax_t file_size = fs::file_size(file_path, error);
-    if (error || file_size > max_size) {
-        return std::nullopt;
-    }
-
-    std::ifstream file(file_path, std::ios::binary);
-    if (!file) {
-        return std::nullopt;
-    }
-
-    std::string content(static_cast<std::size_t>(file_size), '\0');
-    if (!content.empty()) {
-        file.read(content.data(), static_cast<std::streamsize>(content.size()));
-        if (!file || file.gcount() !=
-                         static_cast<std::streamsize>(content.size())) {
-            return std::nullopt;
+    while (total_read < content.size()) {
+        const ssize_t count = ::read(
+            fd, content.data() + total_read, content.size() - total_read);
+        if (count > 0) {
+            total_read += static_cast<std::size_t>(count);
+            continue;
         }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        return std::nullopt;
     }
+
     return content;
 }
 
@@ -177,7 +180,12 @@ bool isWithinPublicRoot(const fs::path& public_root,
 
 std::string buildResponse(const HttpRequest& request,
                           bool& keep_alive,
-                          int& status_code) {
+                          int& status_code,
+                          std::optional<SocketFd>& response_file,
+                          std::size_t& response_file_size) {
+    response_file.reset();
+    response_file_size = 0;
+
     if (request.method != "GET") {
         status_code = 405;
         return buildErrorResponse(405, "Method Not Allowed", keep_alive);
@@ -216,17 +224,49 @@ std::string buildResponse(const HttpRequest& request,
         return buildErrorResponse(403, "Forbidden", keep_alive);
     }
 
-    std::optional<std::string> content =
-        readFile(file_path, kMaxStaticFileSize);
-    if (!content) {
+    SocketFd opened_file(
+        ::open(file_path.c_str(), O_RDONLY | O_CLOEXEC));
+    struct stat file_stat{};
+    if (!opened_file.valid() ||
+        ::fstat(opened_file.get(), &file_stat) < 0 ||
+        !S_ISREG(file_stat.st_mode) ||
+        file_stat.st_size < 0) {
         status_code = 404;
         return buildErrorResponse(404, "Not Found", keep_alive);
     }
 
+    const auto unsigned_file_size =
+        static_cast<std::uintmax_t>(file_stat.st_size);
+    if (unsigned_file_size > kMaxStaticFileSize) {
+        status_code = 404;
+        return buildErrorResponse(404, "Not Found", keep_alive);
+    }
+    const std::size_t file_size =
+        static_cast<std::size_t>(unsigned_file_size);
+
     status_code = 200;
+    if (file_size >= kSendfileThreshold) {
+        response_file = std::move(opened_file);
+        response_file_size = file_size;
+        return buildResponseHeader(
+            200, "OK", contentTypeFor(file_path),
+            file_size, keep_alive);
+    }
+
+    std::optional<std::string> content =
+        readFile(opened_file.get(), file_size);
+    if (!content) {
+        status_code = 500;
+        keep_alive = false;
+        return buildErrorResponse(
+            500, "Internal Server Error", false);
+    }
+
     return buildResponse(200, "OK", contentTypeFor(file_path),
                          *content, keep_alive);
-}}  // namespace
+}
+
+}  // namespace
 
 TcpServer::TcpServer(std::uint16_t port) : port_(port) {}
 
@@ -701,6 +741,8 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
         std::string method = "-";
         std::string path = "-";
         std::string response;
+        std::optional<SocketFd> response_file;
+        std::size_t response_file_size = 0;
         if (result != ParseResult::Complete) {
             response = buildErrorResponse(400, "Bad Request", false);
         } else {
@@ -724,12 +766,14 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
                     buildMetricsBody(), keep_alive);
             } else {
                 response = buildResponse(
-                    request, keep_alive, status_code);
+                    request, keep_alive, status_code,
+                    response_file, response_file_size);
             }
         }
 
         queueResponse(epoll_fd, fd, std::move(response), keep_alive,
-                      status_code, std::move(method), std::move(path));
+                      status_code, std::move(method), std::move(path),
+                      std::move(response_file), response_file_size);
         return;
     }
 
@@ -743,10 +787,15 @@ void TcpServer::handleReadable(int epoll_fd, int fd) {
 
 void TcpServer::handleWritable(int epoll_fd, int fd) {
     while (true) {
-        ssize_t count = 0;
-        int send_error = 0;
+        ssize_t buffer_count = 0;
+        int write_error = 0;
+        bool header_pending = false;
+        bool send_file = false;
         bool finished = false;
         bool invalid_state = false;
+        int input_fd = -1;
+        off_t file_offset = 0;
+        std::size_t file_remaining = 0;
 
         {
             std::lock_guard<std::mutex> lock(connections_mutex_);
@@ -759,120 +808,204 @@ void TcpServer::handleWritable(int epoll_fd, int fd) {
             if (state.state != ConnectionState::Writing ||
                 state.bytes_sent > state.output_buffer.size()) {
                 invalid_state = true;
-            } else {
+            } else if (state.bytes_sent < state.output_buffer.size()) {
+                header_pending = true;
                 const std::size_t remaining =
                     state.output_buffer.size() - state.bytes_sent;
-                if (remaining == 0) {
+                buffer_count = ::send(
+                    fd,
+                    state.output_buffer.data() + state.bytes_sent,
+                    remaining,
+                    MSG_NOSIGNAL);
+                if (buffer_count > 0) {
+                    state.bytes_sent +=
+                        static_cast<std::size_t>(buffer_count);
+                    state.last_active =
+                        std::chrono::steady_clock::now();
+                } else if (buffer_count < 0) {
+                    write_error = errno;
+                }
+            } else if (state.write_mode == WriteMode::File) {
+                if (!state.file_fd || !state.file_fd->valid()) {
+                    invalid_state = true;
+                } else if (state.file_remaining == 0) {
+                    state.file_fd.reset();
+                    state.file_offset = 0;
+                    state.write_mode = WriteMode::Buffer;
                     finished = true;
                 } else {
-                    count = ::send(
-                        fd,
-                        state.output_buffer.data() + state.bytes_sent,
-                        remaining,
-                        MSG_NOSIGNAL);
-                    if (count > 0) {
-                        state.bytes_sent +=
-                            static_cast<std::size_t>(count);
-                        state.last_active =
-                            std::chrono::steady_clock::now();
-                    } else if (count < 0) {
-                        send_error = errno;
-                    }
+                    send_file = true;
+                    input_fd = state.file_fd->get();
+                    file_offset = state.file_offset;
+                    file_remaining = state.file_remaining;
                 }
+            } else {
+                finished = true;
             }
         }
 
-        if (count > 0) {
+        if (buffer_count > 0) {
             metrics_.total_bytes_sent.fetch_add(
-                static_cast<std::uint64_t>(count),
+                static_cast<std::uint64_t>(buffer_count),
                 std::memory_order_relaxed);
+            continue;
         }
 
         if (invalid_state) {
             closeConnection(epoll_fd, fd);
             return;
         }
-        if (finished) {
-            bool reuse_connection = false;
-            bool log_ready = false;
-            AccessLog access_log;
-            {
-                std::lock_guard<std::mutex> lock(connections_mutex_);
-                const auto connection = connections_.find(fd);
-                if (connection == connections_.end()) {
-                    return;
-                }
 
-                Connection& state = connection->second;
-                const auto completed_at = std::chrono::steady_clock::now();
-                if (state.response_status_code != 0) {
-                    access_log.client_ip = state.client_ip;
-                    access_log.method = state.log_method;
-                    access_log.path = state.log_path;
-                    access_log.status_code = state.response_status_code;
-                    access_log.response_bytes = state.response_bytes;
-                    if (state.request_started_set) {
-                        access_log.duration_us =
-                            std::chrono::duration_cast<
-                                std::chrono::microseconds>(
-                                completed_at - state.request_started)
-                                .count();
-                    }
-                    state.response_status_code = 0;
-                    log_ready = true;
-                }
-
-                ++state.requests_served;
-                reuse_connection =
-                    state.keep_alive &&
-                    state.requests_served < kMaxRequestsPerConnection;
-
-                if (reuse_connection) {
-                    state.input_buffer.clear();
-                    state.output_buffer.clear();
-                    state.bytes_sent = 0;
-                    state.state = ConnectionState::Reading;
-                    state.keep_alive = false;
-                    state.log_method = "-";
-                    state.log_path = "-";
-                    state.response_bytes = 0;
-                    state.request_started_set = false;
-                    state.last_active = completed_at;
-                }
-            }
-
-            if (log_ready) {
-                access_log.timestamp = currentTimestamp();
-                access_logger_.log(std::move(access_log));
-            }
-
-            if (reuse_connection) {
-                rearmRead(epoll_fd, fd);
-            } else {
+        if (header_pending) {
+            if (buffer_count == 0) {
                 closeConnection(epoll_fd, fd);
+                return;
             }
-            return;
-        }
-        if (count == 0) {
+            if (write_error == EINTR) {
+                continue;
+            }
+            if (write_error == EAGAIN || write_error == EWOULDBLOCK) {
+                rearmWrite(epoll_fd, fd);
+                return;
+            }
+            if (write_error != EPIPE && write_error != ECONNRESET) {
+                errno = write_error;
+                printError("send");
+            }
             closeConnection(epoll_fd, fd);
             return;
         }
-        if (count > 0) {
-            continue;
-        }
-        if (send_error == EINTR) {
-            continue;
-        }
-        if (send_error == EAGAIN || send_error == EWOULDBLOCK) {
-            rearmWrite(epoll_fd, fd);
+
+        if (send_file) {
+            off_t updated_offset = file_offset;
+            const ssize_t file_count = ::sendfile(
+                fd, input_fd, &updated_offset, file_remaining);
+
+            if (file_count > 0) {
+                bool update_failed = false;
+                {
+                    std::lock_guard<std::mutex> lock(connections_mutex_);
+                    const auto connection = connections_.find(fd);
+                    if (connection == connections_.end()) {
+                        return;
+                    }
+
+                    Connection& state = connection->second;
+                    const std::size_t sent =
+                        static_cast<std::size_t>(file_count);
+                    if (state.state != ConnectionState::Writing ||
+                        state.write_mode != WriteMode::File ||
+                        !state.file_fd ||
+                        state.file_fd->get() != input_fd ||
+                        sent > state.file_remaining) {
+                        update_failed = true;
+                    } else {
+                        state.file_offset = updated_offset;
+                        state.file_remaining -= sent;
+                        state.last_active =
+                            std::chrono::steady_clock::now();
+                    }
+                }
+
+                if (update_failed) {
+                    closeConnection(epoll_fd, fd);
+                    return;
+                }
+                metrics_.total_bytes_sent.fetch_add(
+                    static_cast<std::uint64_t>(file_count),
+                    std::memory_order_relaxed);
+                continue;
+            }
+
+            if (file_count == 0) {
+                std::cerr
+                    << "sendfile reached EOF before the expected file size\n";
+                metrics_.server_errors.fetch_add(
+                    1, std::memory_order_relaxed);
+                closeConnection(epoll_fd, fd);
+                return;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                rearmWrite(epoll_fd, fd);
+                return;
+            }
+            if (errno != EPIPE && errno != ECONNRESET) {
+                printError("sendfile");
+            }
+            closeConnection(epoll_fd, fd);
             return;
         }
 
-        if (send_error != EPIPE && send_error != ECONNRESET) {
-            errno = send_error;
-            printError("send");
+        if (!finished) {
+            closeConnection(epoll_fd, fd);
+            return;
         }
-        closeConnection(epoll_fd, fd);
+
+        bool reuse_connection = false;
+        bool log_ready = false;
+        AccessLog access_log;
+        {
+            std::lock_guard<std::mutex> lock(connections_mutex_);
+            const auto connection = connections_.find(fd);
+            if (connection == connections_.end()) {
+                return;
+            }
+
+            Connection& state = connection->second;
+            const auto completed_at = std::chrono::steady_clock::now();
+            if (state.response_status_code != 0) {
+                access_log.client_ip = state.client_ip;
+                access_log.method = state.log_method;
+                access_log.path = state.log_path;
+                access_log.status_code = state.response_status_code;
+                access_log.response_bytes = state.response_bytes;
+                if (state.request_started_set) {
+                    access_log.duration_us =
+                        std::chrono::duration_cast<
+                            std::chrono::microseconds>(
+                            completed_at - state.request_started)
+                            .count();
+                }
+                state.response_status_code = 0;
+                log_ready = true;
+            }
+
+            ++state.requests_served;
+            reuse_connection =
+                state.keep_alive &&
+                state.requests_served < kMaxRequestsPerConnection;
+
+            if (reuse_connection) {
+                state.input_buffer.clear();
+                state.output_buffer.clear();
+                state.bytes_sent = 0;
+                state.write_mode = WriteMode::Buffer;
+                state.file_fd.reset();
+                state.file_offset = 0;
+                state.file_remaining = 0;
+                state.state = ConnectionState::Reading;
+                state.keep_alive = false;
+                state.log_method = "-";
+                state.log_path = "-";
+                state.response_bytes = 0;
+                state.request_started_set = false;
+                state.last_active = completed_at;
+            }
+        }
+
+        if (log_ready) {
+            access_log.timestamp = currentTimestamp();
+            access_logger_.log(std::move(access_log));
+        }
+
+        if (reuse_connection) {
+            rearmRead(epoll_fd, fd);
+        } else {
+            closeConnection(epoll_fd, fd);
+        }
         return;
     }
 }
@@ -883,7 +1016,9 @@ void TcpServer::queueResponse(int epoll_fd,
                               bool keep_alive,
                               int status_code,
                               std::string method,
-                              std::string path) {
+                              std::string path,
+                              std::optional<SocketFd> file_fd,
+                              std::size_t file_size) {
     bool found = false;
     bool queued = false;
     {
@@ -892,15 +1027,24 @@ void TcpServer::queueResponse(int epoll_fd,
         if (connection != connections_.end()) {
             found = true;
             Connection& state = connection->second;
-            if (state.state == ConnectionState::Reading) {
+            const bool valid_file_state =
+                !file_fd || (file_fd->valid() && file_size > 0);
+            if (state.state == ConnectionState::Reading &&
+                valid_file_state) {
                 state.output_buffer = std::move(response);
                 state.bytes_sent = 0;
+                state.write_mode =
+                    file_fd ? WriteMode::File : WriteMode::Buffer;
+                state.file_fd = std::move(file_fd);
+                state.file_offset = 0;
+                state.file_remaining = file_size;
                 state.state = ConnectionState::Writing;
                 state.keep_alive = keep_alive;
                 state.log_method = std::move(method);
                 state.log_path = std::move(path);
                 state.response_status_code = status_code;
-                state.response_bytes = state.output_buffer.size();
+                state.response_bytes =
+                    state.output_buffer.size() + file_size;
                 queued = true;
             }
         }

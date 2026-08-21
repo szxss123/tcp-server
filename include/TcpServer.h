@@ -9,9 +9,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
+
+#include <sys/types.h>
 
 struct ServerMetrics {
     std::atomic<std::uint64_t> total_requests{0};
@@ -41,6 +44,11 @@ private:
         Writing,
     };
 
+    enum class WriteMode {
+        Buffer,
+        File,
+    };
+
     struct Connection {
         Connection(SocketFd socket_fd, std::string remote_ip)
             : socket(std::move(socket_fd)),
@@ -51,6 +59,10 @@ private:
         std::string input_buffer;
         std::string output_buffer;
         std::size_t bytes_sent{0};
+        WriteMode write_mode{WriteMode::Buffer};
+        std::optional<SocketFd> file_fd;
+        off_t file_offset{0};
+        std::size_t file_remaining{0};
         ConnectionState state{ConnectionState::Reading};
         bool keep_alive{false};
         std::size_t requests_served{0};
@@ -73,7 +85,9 @@ private:
                        bool keep_alive,
                        int status_code,
                        std::string method,
-                       std::string path);
+                       std::string path,
+                       std::optional<SocketFd> file_fd = std::nullopt,
+                       std::size_t file_size = 0);
     void rearmRead(int epoll_fd, int fd);
     void rearmWrite(int epoll_fd, int fd);
     void closeIdleConnections(int epoll_fd,
